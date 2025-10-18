@@ -1,0 +1,2691 @@
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <cmath>
+#include <cppad/ipopt/solve.hpp>
+#include <random>
+#include <map>
+#include "delaunay.hpp"
+#include <chrono>
+using namespace delaunay;
+using namespace std;
+
+struct myPoint {
+    double x;
+    double y;
+
+    bool operator<(const myPoint& other) const {
+        return x < other.x || (x == other.x && y < other.y);
+    }
+};
+
+struct edge {
+    int a;
+    int b;
+
+};
+struct mytriangle{
+    int a, b, c;
+};
+struct Block {
+    string name;
+    int width;
+    int height;
+    double center_x;
+    double center_y;
+    int lA; //fixed => left 1 right 2 
+    int A; // fixed => down 1 top 2
+    double r;
+    vector<myPoint>  points;
+    // round x y
+
+};
+struct Length {
+    // soft : 0 <= index < soft_num , fixed : soft_num <= index < soft_num + fixed_num
+    int name[2]; 
+    int len;
+};
+struct Chip {
+    int width;
+    int height;
+    int soft_num, fixed_num, connect_num;
+    double length;
+    vector<Block> soft;
+    vector<Block> fixed;
+    vector<Length> connect;
+};
+namespace Data{
+    Chip chip, temp_chip; // temp chip only soft
+    int IP1_num, IP1_x1, IP1_x2, IP1_y1, IP1_y2;
+    double  IP1_min_obj, IP1_obj; 
+    bool IP1_flag;
+    vector<Point<float>> points;
+    // vector<vector<int>> Cv[201], Ch[201];
+    bool Nv_start[201] = {true}, Nv_end[201] = {true}, Nh_start[201] = {true}, Nh_end[201] = {true};
+    vector<int> nvs_list, nve_list, nhs_list, nhe_list;
+    vector<edge> Cv_list, Ch_list, overlapped_list;
+    vector<int> cv_pos[201], ch_pos[201];
+    double IP2_W, IP2_H, IP2_last_obj;
+    int IP2_overlapped_num, IP2_edge_num, IP2_bound_flag, IP2_area_num1, IP2_area_num2, IP2_last_type; // overlapped num,max overlapped num,  flag true -> out of bound , area illegal num
+
+}
+namespace IP{
+    using CppAD::AD;
+
+    class FG_eval1 {
+    public:
+        typedef CPPAD_TESTVECTOR( AD<double> ) ADvector;
+        void operator()(ADvector& fg, const ADvector& in_x){     
+
+            // Fortran style indexing
+            AD<double> x[Data::chip.soft_num], y[Data::chip.soft_num];
+            for (int i = 0 ; i < (Data::chip.soft_num*2) ; i++){
+                if (i % 2){
+                    y[i/2] = in_x[i];
+                }else{
+                    x[i/2] = in_x[i];
+                }
+            }
+            // f(x)
+            fg[0] = 0;
+            for (int i = 0; i < Data::chip.connect_num; i++){
+                int first_num = Data::chip.connect[i].name[0], second_num = Data::chip.connect[i].name[1];
+                double first_r , second_r;
+                bool first_flag, second_flag;
+
+                if (Data::chip.soft_num > first_num){ //first soft
+                    first_flag = true;
+                    first_r = Data::chip.soft[first_num].r;
+                }else{ //first fixed 
+                    first_flag = false;
+                    first_num = first_num - Data::chip.soft_num;
+                    first_r = Data::chip.fixed[first_num].r;
+                }
+                if (Data::chip.soft_num > second_num){ //second soft
+                    second_flag = true;
+                    second_r = Data::chip.soft[second_num].r;
+                }else{ //second fixed
+                    second_flag = false;
+                    second_num = second_num - Data::chip.soft_num;
+                    second_r = Data::chip.fixed[second_num].r;
+                }
+                AD<double> s = 1000 *  first_r * second_r * first_r * second_r       ; //r *r ^2
+                AD<double> d = 1, p = 1 + (first_r + second_r )*(first_r + second_r ), t = 1000000 * (first_r + second_r) * (first_r + second_r);
+                AD<double> T = sqrt(t/(Data::chip.connect[i].len ));
+                //four case
+                if (first_flag && second_flag){ // soft soft
+                    d +=  ( (((x[first_num] - x[second_num]) * (x[first_num] - x[second_num])) + ((y[first_num] - y[second_num]) * (y[first_num] - y[second_num]))))  ; //sqrt((x -x)^2 + (y-y)^2)
+                    // p -= d; //(r+r)-d
+
+                }else if (first_flag && !second_flag){ // soft fixed
+                    d += ( (((x[first_num] - Data::chip.fixed[second_num].center_x) * (x[first_num] - Data::chip.fixed[second_num].center_x)) + ((y[first_num] - Data::chip.fixed[second_num].center_y) * (y[first_num] - Data::chip.fixed[second_num].center_y)))); //sqrt((x -x)^2 + (y-y)^2)
+                    // p -=  d; //(r+r)-d
+
+                }else if (!first_flag && second_flag){ // fixed soft 
+                    d += ( (((Data::chip.fixed[first_num].center_x - x[second_num]) * (Data::chip.fixed[first_num].center_x - x[second_num])) + ((Data::chip.fixed[first_num].center_y - y[second_num]) * (Data::chip.fixed[first_num].center_y - y[second_num])))); //sqrt((x -x)^2 + (y-y)^2)
+                    // p -= d; //(r+r)-d
+
+                }else{ //fixed fixed
+                    first_num = first_num - Data::chip.soft_num;
+                    second_num = second_num - Data::chip.soft_num;
+                    d += ( ((((Data::chip.fixed[first_num].center_x - Data::chip.fixed[second_num].center_x) * (Data::chip.fixed[first_num].center_x - Data::chip.fixed[second_num].center_x)) + ((Data::chip.fixed[first_num].center_y -Data::chip.fixed[second_num].center_y) * (Data::chip.fixed[first_num].center_y -Data::chip.fixed[second_num].center_y))))); //sqrt((x -x)^2 + (y-y)^2)
+                    // p -= d; //(r+r)-d
+                }
+                ////pp IP1()
+                // if (p >= 0){
+                //     fg[0] +=   ( Data::chip.connect[i].len* (d) +   s * ((p) / (d) ));
+                // }else{
+                //     fg[0] +=   ( Data::chip.connect[i].len* sqrt(d) +  ((p) / (d) ));
+                // }
+                    // fg[0] +=   ( Data::chip.connect[i].len * (d) - ( s * ((p) / (d) )));
+                    fg[0] +=   ( Data::chip.connect[i].len * (d) - ( s * ((p) / (d) )));
+                // //ar
+                // if (d >= T){
+                    // fg[0] +=    Data::chip.connect[i].len* (d) +   ((10000 * (first_r + second_r) * (first_r + second_r))/d) - 1;
+                // }else{
+                    // fg[0] +=  200000*sqrt(Data::chip.connect[i].len * (10000 * (first_r + second_r) * (first_r + second_r))) - 1;
+                // }
+                
+            }
+            return;
+        }
+
+    };
+    class FG_eval2 {
+    public:
+        typedef CPPAD_TESTVECTOR( AD<double> ) ADvector;
+        void operator()(ADvector& fg, const ADvector& in_x){     
+
+            // Fortran style indexing
+            AD<double> x[Data::chip.soft_num], y[Data::chip.soft_num], w[Data::chip.soft_num], h[Data::chip.soft_num] ;
+            // for (int i = 0; i < Data::chip.soft_num ; i++){
+            //     for (int j = 0 ; j < 4; j++){
+            //         if (j == 0){
+            //             x[i] = in_x[i*4 + j]; 
+            //         }else if (j == 1){
+            //             y[i] = in_x[i*4 + j]; 
+            //         }else if (j == 2){
+            //             w[i] = in_x[i*4 + j]; 
+            //         }else{
+            //             h[i] = in_x[i*4 + j]; 
+            //         }
+            //     }
+            // }
+
+            for (int i = 0; i < Data::chip.soft_num ; i++){
+                for (int j = 0 ; j < 2; j++){
+                    if (j == 0){
+                        x[i] = in_x[i*2 + j]; 
+                    }else if (j == 1){
+                        y[i] = in_x[i*2 + j]; 
+                    }
+                }
+            }
+            for (int i = 0; i < Data::chip.soft_num ; i++){
+                for (int j = 0 ; j < 2; j++){
+                    if (j == 0){
+                        w[i] = in_x[i*2 + j + Data::chip.soft_num*2]; 
+                    }else{
+                        h[i] = in_x[i*2 + j + Data::chip.soft_num*2]; 
+                    }
+                }
+            }
+
+
+            //IP2()
+            // f(x)
+            fg[0] = 0;
+            // fg[0] = 0;
+            // for (int i = 0; i < Data::chip.soft_num ; i++){
+                    // fg[0] += 100000* abs( (x[i] - Data::chip.center_x) * (x[i] - Data::chip.soft[i].center_x));
+                    // fg[0] +=  ( (x[i] - Data::chip.soft[i].width/2) * (x[i] - Data::chip.soft[i].width/2));
+
+                    // fg[0] += 100000*  abs((y[i] - Data::chip.soft[i].center_y) * (y[i] - Data::chip.soft[i].center_y)) ;
+                    // fg[0] += ((y[i] - Data::chip.soft[i].height/2) * (y[i] - Data::chip.soft[i].height/2)) ;
+                    // fg[0] += w[i] + h[i];
+                    // fg[0] += ( (w[i] - Data::chip.soft[i].width)   * (w[i] - Data::chip.soft[i].width)   );
+                    // fg[0] += -100*abs( (w[i] - Data::chip.soft[i].width)   );
+
+                    // fg[0] += ( (h[i] - Data::chip.soft[i].height)  *  (h[i] - Data::chip.soft[i].height)  );
+                    // fg[0] += -100*abs( (h[i] - Data::chip.soft[i].height)  );
+
+                    // fg[0] += x[i] + y[i] + w[i] + h[i];
+            // }
+            AD<double> x1[Data::chip.connect_num] ,  y1[Data::chip.connect_num] ,  x2[Data::chip.connect_num] ,  y2[Data::chip.connect_num];
+            for (int i = 0; i < Data::chip.connect_num; i++){
+                int n1 = Data::chip.connect[i].name[0] ,n2 = Data::chip.connect[i].name[1] ;
+                x1[i] = n1 < Data::chip.soft_num ? x[n1] + w[n1]/2 : Data::chip.fixed[n1-Data::chip.soft_num].center_x  + Data::chip.fixed[n1-Data::chip.soft_num].width/2 ; 
+                y1[i] = n1 < Data::chip.soft_num ? y[n1] + h[n1]/2 : Data::chip.fixed[n1-Data::chip.soft_num].center_y  + Data::chip.fixed[n1-Data::chip.soft_num].height/2 ; 
+                x2[i] = n2 < Data::chip.soft_num ? x[n2] + w[n2]/2 : Data::chip.fixed[n2-Data::chip.soft_num].center_x  + Data::chip.fixed[n2-Data::chip.soft_num].width/2 ; 
+                y2[i] = n2 < Data::chip.soft_num ?y[n2] + h[n2]/2 : Data::chip.fixed[n2-Data::chip.soft_num].center_y  + Data::chip.fixed[n2-Data::chip.soft_num].height/2 ; 
+                fg[0] += ( abs(x1[i]-x2[i]) + abs(y1[i]-y2[i]) ) * Data::chip.connect[i].len;
+            }
+
+
+
+
+
+            // g
+            //Ch
+            for (int i = 0; i < Data::Ch_list.size(); i++){ 
+                if (Data::Ch_list[i].a < Data::chip.soft_num){
+                    fg[i+1] = Data::Ch_list[i].b < Data::chip.soft_num ? x[Data::Ch_list[i].a] + w[Data::Ch_list[i].a] - x[Data::Ch_list[i].b] :x[Data::Ch_list[i].a] + w[Data::Ch_list[i].a]  -  Data::chip.fixed[Data::Ch_list[i].b-Data::chip.soft_num].center_x;
+                }else{
+                    fg[i+1] = Data::Ch_list[i].b < Data::chip.soft_num ? Data::chip.fixed[Data::Ch_list[i].a-Data::chip.soft_num].center_x + Data::chip.fixed[Data::Ch_list[i].a-Data::chip.soft_num].width  - x[Data::Ch_list[i].b] :Data::chip.fixed[Data::Ch_list[i].a-Data::chip.soft_num].center_x + Data::chip.fixed[Data::Ch_list[i].a-Data::chip.soft_num].width  -  Data::chip.fixed[Data::Ch_list[i].b-Data::chip.soft_num].center_x;
+                }
+            }
+            //Cv
+            for (int i = Data::Ch_list.size(), j = 0; i < Data::Ch_list.size() + Data::Cv_list.size(); i++, j++){  
+                if (Data::Cv_list[j].a < Data::chip.soft_num){
+                    fg[i+1] = Data::Cv_list[j].b < Data::chip.soft_num ? y[Data::Cv_list[j].a] +  h[Data::Cv_list[j].a] - y[Data::Cv_list[j].b] :y[Data::Cv_list[j].a]  +   h[Data::Cv_list[j].a]  -  Data::chip.fixed[Data::Cv_list[j].b-Data::chip.soft_num].center_y;
+                }else{
+                    fg[i+1] = Data::Cv_list[j].b < Data::chip.soft_num ? Data::chip.fixed[Data::Cv_list[j].a-Data::chip.soft_num].center_y + Data::chip.fixed[Data::Cv_list[j].a-Data::chip.soft_num].height  - y[Data::Cv_list[j].b] :Data::chip.fixed[Data::Cv_list[j].a-Data::chip.soft_num].center_y + Data::chip.fixed[Data::Cv_list[j].a-Data::chip.soft_num].height  -  Data::chip.fixed[Data::Cv_list[j].b-Data::chip.soft_num].center_y;
+                }
+            }
+            // soft A
+            for (int i = Data::Ch_list.size() + Data::Cv_list.size() , j = 0; i < Data::Ch_list.size() + Data::Cv_list.size() + Data::chip.soft_num; i++, j++){ 
+                fg[i+1] = w[j] * h[j];
+            }
+        
+            //A ratio
+            for (int i = Data::Ch_list.size() + Data::Cv_list.size() + Data::chip.soft_num, j = 0; i < Data::Ch_list.size() + Data::Cv_list.size() + Data::chip.soft_num + Data::chip.soft_num; i++, j++){  
+                fg[i+1] = w[j] / h[j];
+            }
+            //Nhe
+            for (int i = Data::Ch_list.size() + Data::Cv_list.size() + Data::chip.soft_num+ Data::chip.soft_num, j = 0; i <Data::Ch_list.size() + Data::Cv_list.size() + Data::chip.soft_num + Data::chip.soft_num + Data::chip.soft_num; i++, j++){ 
+                   fg[i+1] = x[j] + w[j];
+
+            }
+            // Nve
+            for (int i = Data::Ch_list.size() + Data::Cv_list.size() + Data::chip.soft_num+ Data::chip.soft_num+ Data::chip.soft_num, j = 0; i <Data::Ch_list.size() + Data::Cv_list.size() + Data::chip.soft_num + Data::chip.soft_num + Data::chip.soft_num+ Data::chip.soft_num; i++, j++){ 
+                fg[i+1] = y[j] + h[j];             
+
+            }
+            // // cout << "eval2 : fg " << Data::Ch_list.size() + Data::Cv_list.size() + Data::nhe_list.size() + Data::nve_list.size() + Data::chip.soft_num << endl;
+            return;
+        }
+    };
+
+    class FG_eval20 {
+    public:
+        typedef CPPAD_TESTVECTOR( AD<double> ) ADvector;
+        void operator()(ADvector& fg, const ADvector& in_x){     
+
+            // Fortran style indexing
+            AD<double> x[Data::chip.soft_num], y[Data::chip.soft_num];
+            for (int i = 0 ; i < (Data::chip.soft_num*2) ; i++){
+                if (i % 2){
+                    y[i/2] = in_x[i];
+                }else{
+                    x[i/2] = in_x[i];
+                }
+            }
+            //IP20()
+            // f(x)
+            fg[0] = 0;
+            for (int i = 0; i < Data::chip.soft_num ; i++){
+                // fg[0] +=  abs((x[i] - Data::chip.width/2) * (x[i] - Data::chip.width/2));
+                // fg[0] +=  abs((y[i] - Data::chip.height/2) * (y[i] - Data::chip.height/2));
+                fg[0] +=  abs((x[i] - Data::chip.soft[i].center_x) * (x[i] - Data::chip.soft[i].center_x));
+                fg[0] +=  abs((y[i] - Data::chip.soft[i].center_y) * (y[i] - Data::chip.soft[i].center_y));
+                    // fg[0] += x[i] + y[i] + w[i] + h[i];
+            }
+            // AD<double> x1[Data::chip.connect_num] ,  y1[Data::chip.connect_num] ,  x2[Data::chip.connect_num] ,  y2[Data::chip.connect_num];
+            // for (int i = 0; i < Data::chip.connect_num; i++){
+            //     int n1 = Data::chip.connect[i].name[0] ,n2 = Data::chip.connect[i].name[1] ;
+            //     x1[i] = n1 < Data::chip.soft_num ? x[n1] + Data::chip.soft[n1].width/2 : Data::chip.fixed[n1-Data::chip.soft_num].center_x  + Data::chip.fixed[n1-Data::chip.soft_num].width/2 ; 
+            //     y1[i] = n1 < Data::chip.soft_num ? y[n1] + Data::chip.soft[n1].height/2 : Data::chip.fixed[n1-Data::chip.soft_num].center_y  + Data::chip.fixed[n1-Data::chip.soft_num].height/2 ; 
+            //     x2[i] = n2 < Data::chip.soft_num ? x[n2] + Data::chip.soft[n2].width/2 : Data::chip.fixed[n2-Data::chip.soft_num].center_x  + Data::chip.fixed[n2-Data::chip.soft_num].width/2 ; 
+            //     y2[i] = n2 < Data::chip.soft_num ?y[n2] + Data::chip.soft[n2].height/2 : Data::chip.fixed[n2-Data::chip.soft_num].center_y  + Data::chip.fixed[n2-Data::chip.soft_num].height/2 ; 
+            //     fg[0] += ( abs(x1[i]-x2[i]) + abs(y1[i]-y2[i]) ) * Data::chip.connect[i].len;
+            // }
+
+
+
+
+            // g
+            //Ch
+            for (int i = 0; i < Data::Ch_list.size(); i++){ 
+                if (Data::Ch_list[i].a < Data::chip.soft_num){
+                    fg[i+1] = Data::Ch_list[i].b < Data::chip.soft_num ? x[Data::Ch_list[i].a] + Data::chip.soft[Data::Ch_list[i].a].width - x[Data::Ch_list[i].b] :x[Data::Ch_list[i].a] + Data::chip.soft[Data::Ch_list[i].a].width  -  Data::chip.fixed[Data::Ch_list[i].b-Data::chip.soft_num].center_x;
+                }else{
+                    fg[i+1] = Data::Ch_list[i].b < Data::chip.soft_num ? Data::chip.fixed[Data::Ch_list[i].a-Data::chip.soft_num].center_x + Data::chip.fixed[Data::Ch_list[i].a-Data::chip.soft_num].width  - x[Data::Ch_list[i].b] :Data::chip.fixed[Data::Ch_list[i].a-Data::chip.soft_num].center_x + Data::chip.fixed[Data::Ch_list[i].a-Data::chip.soft_num].width  -  Data::chip.fixed[Data::Ch_list[i].b-Data::chip.soft_num].center_x;
+                }
+            }
+            //Cv
+            for (int i = Data::Ch_list.size(), j = 0; i < Data::Ch_list.size() + Data::Cv_list.size(); i++, j++){  
+                if (Data::Cv_list[j].a < Data::chip.soft_num){
+                    fg[i+1] = Data::Cv_list[j].b < Data::chip.soft_num ? y[Data::Cv_list[j].a] +  Data::chip.soft[Data::Cv_list[j].a].height  - y[Data::Cv_list[j].b] :y[Data::Cv_list[j].a]  +   Data::chip.soft[Data::Cv_list[j].a].height  -  Data::chip.fixed[Data::Cv_list[j].b-Data::chip.soft_num].center_y;
+                }else{
+                    fg[i+1] = Data::Cv_list[j].b < Data::chip.soft_num ? Data::chip.fixed[Data::Cv_list[j].a-Data::chip.soft_num].center_y + Data::chip.fixed[Data::Cv_list[j].a-Data::chip.soft_num].height  - y[Data::Cv_list[j].b] :Data::chip.fixed[Data::Cv_list[j].a-Data::chip.soft_num].center_y + Data::chip.fixed[Data::Cv_list[j].a-Data::chip.soft_num].height  -  Data::chip.fixed[Data::Cv_list[j].b-Data::chip.soft_num].center_y;
+                }
+            }
+            //Nhe
+            for (int i = Data::Ch_list.size() + Data::Cv_list.size() , j = 0; i <Data::Ch_list.size() + Data::Cv_list.size() + Data::chip.soft_num; i++, j++){ 
+                   fg[i+1] = x[j] +  Data::chip.soft[j].width;
+
+            }
+            // Nve
+            for (int i = Data::Ch_list.size() + Data::Cv_list.size() + Data::chip.soft_num, j = 0; i <Data::Ch_list.size() + Data::Cv_list.size()+ Data::chip.soft_num; i++, j++){ 
+                fg[i+1] = y[j] + Data::chip.soft[j].height;             
+
+            }
+            // // cout << "eval2 : fg " << Data::Ch_list.size() + Data::Cv_list.size() + Data::nhe_list.size() + Data::nve_list.size() + Data::chip.soft_num << endl;
+            return;
+        }
+    };
+    //ip21()
+    class FG_eval21 {
+    public:
+        typedef CPPAD_TESTVECTOR( AD<double> ) ADvector;
+        void operator()(ADvector& fg, const ADvector& in_x){     
+
+            // Fortran style indexing
+            AD<double> w[Data::chip.soft_num], h[Data::chip.soft_num];
+            for (int i = 0 ; i < (Data::chip.soft_num*2) ; i++){
+                if (i % 2){
+                    h[i/2] = in_x[i];
+                }else{
+                    w[i/2] = in_x[i];
+                }
+            }
+            //IP21()
+            // f(x)
+            fg[0] = 0;
+            for (int i = 0; i < Data::chip.soft_num ; i++){
+                for (int j = 0 ; j < 2; j++){
+                    if (j == 0){
+                        // fg[0] += abs(w[i] - Data::chip.soft[i].width);
+                        fg[0] += abs(w[i] );
+                    }else if (j == 1){
+                        // fg[0] += abs(h[i] - Data::chip.soft[i].height);
+                        fg[0] += abs(h[i] );
+                    }
+                }
+                    // fg[0] += x[i] + y[i] + w[i] + h[i];
+            }
+
+
+            // g
+            //Ch
+            for (int i = 0; i < Data::Ch_list.size(); i++){ 
+                if (Data::Ch_list[i].a < Data::chip.soft_num){
+                    fg[i+1] = Data::Ch_list[i].b < Data::chip.soft_num ? Data::chip.soft[Data::Ch_list[i].a].center_x  + w[Data::Ch_list[i].a] - Data::chip.soft[Data::Ch_list[i].b].center_x  : Data::chip.soft[Data::Ch_list[i].a].center_x + w[Data::Ch_list[i].a]  -   Data::chip.fixed[Data::Ch_list[i].b-Data::chip.soft_num].center_x;
+                }else{
+                    fg[i+1] = Data::Ch_list[i].b < Data::chip.soft_num ? Data::chip.fixed[Data::Ch_list[i].a-Data::chip.soft_num].center_x + Data::chip.fixed[Data::Ch_list[i].a-Data::chip.soft_num].width  -  Data::chip.soft[Data::Ch_list[i].b].center_x :Data::chip.fixed[Data::Ch_list[i].a-Data::chip.soft_num].center_x + Data::chip.fixed[Data::Ch_list[i].a-Data::chip.soft_num].width  -  Data::chip.fixed[Data::Ch_list[i].b-Data::chip.soft_num].center_x;
+                }
+            }
+            //Cv
+            for (int i = Data::Ch_list.size(), j = 0; i < Data::Ch_list.size() + Data::Cv_list.size(); i++, j++){  
+                if (Data::Cv_list[j].a < Data::chip.soft_num){
+                    fg[i+1] = Data::Cv_list[j].b < Data::chip.soft_num ? Data::chip.soft[Data::Cv_list[j].a].center_y  +  h[Data::Cv_list[j].a] - Data::chip.soft[Data::Cv_list[j].b].center_y  :Data::chip.soft[Data::Cv_list[j].a].center_y +   h[Data::Cv_list[j].a]  -  Data::chip.fixed[Data::Cv_list[j].b-Data::chip.soft_num].center_y;
+                }else{
+                    fg[i+1] = Data::Cv_list[j].b < Data::chip.soft_num ? Data::chip.fixed[Data::Cv_list[j].a-Data::chip.soft_num].center_y + Data::chip.fixed[Data::Cv_list[j].a-Data::chip.soft_num].height  -Data::chip.soft[Data::Cv_list[j].b].center_y :Data::chip.fixed[Data::Cv_list[j].a-Data::chip.soft_num].center_y + Data::chip.fixed[Data::Cv_list[j].a-Data::chip.soft_num].height  -  Data::chip.fixed[Data::Cv_list[j].b-Data::chip.soft_num].center_y;
+                }
+            }
+            // soft A
+            for (int i = Data::Ch_list.size() + Data::Cv_list.size() , j = 0; i < Data::Ch_list.size() + Data::Cv_list.size() + Data::chip.soft_num; i++, j++){ 
+                fg[i+1] = w[j] * h[j];
+            }
+        
+            //A ratio
+            for (int i = Data::Ch_list.size() + Data::Cv_list.size() + Data::chip.soft_num, j = 0; i < Data::Ch_list.size() + Data::Cv_list.size() + Data::chip.soft_num + Data::chip.soft_num; i++, j++){  
+                fg[i+1] = w[j] / h[j];
+            }
+            //Nhe
+            for (int i = Data::Ch_list.size() + Data::Cv_list.size() + Data::chip.soft_num+ Data::chip.soft_num, j = 0; i <Data::Ch_list.size() + Data::Cv_list.size() + Data::chip.soft_num + Data::chip.soft_num + Data::chip.soft_num; i++, j++){ 
+                   fg[i+1] = Data::chip.soft[j].center_x + w[j];
+
+            }
+            // Nve
+            for (int i = Data::Ch_list.size() + Data::Cv_list.size() + Data::chip.soft_num+ Data::chip.soft_num+ Data::chip.soft_num, j = 0; i <Data::Ch_list.size() + Data::Cv_list.size() + Data::chip.soft_num + Data::chip.soft_num + Data::chip.soft_num+ Data::chip.soft_num; i++, j++){ 
+                fg[i+1] = Data::chip.soft[j].center_y  + h[j];             
+
+            }
+            // // cout << "eval2 : fg " << Data::Ch_list.size() + Data::Cv_list.size() + Data::nhe_list.size() + Data::nve_list.size() + Data::chip.soft_num << endl;
+            return;
+        }
+    };
+    class FG_eval22 {
+    public:
+        typedef CPPAD_TESTVECTOR( AD<double> ) ADvector;
+        void operator()(ADvector& fg, const ADvector& in_x){     
+
+            // Fortran style indexing
+            AD<double> x[Data::chip.soft_num], y[Data::chip.soft_num];
+            for (int i = 0 ; i < (Data::chip.soft_num*2) ; i++){
+                if (i % 2){
+                    y[i/2] = in_x[i];
+                }else{
+                    x[i/2] = in_x[i];
+                }
+            }
+            //IP22()
+            // f(x)
+            fg[0] = 0;
+            for (int i = 0; i < Data::chip.soft_num ; i++){
+                fg[0] +=  abs((x[i] - Data::chip.soft[i].center_x) * (x[i] - Data::chip.soft[i].center_x));
+                fg[0] += abs((y[i] - Data::chip.soft[i].center_y) * (y[i] - Data::chip.soft[i].center_y));
+                    // fg[0] += x[i] + y[i] + w[i] + h[i];
+            }
+
+            // g
+            //Nhe
+            for (int i = 0; i < Data::chip.soft_num; i++){ 
+                   fg[i+1] = x[i] +  Data::chip.soft[i].width;
+            }
+            // Nve
+            for (int i = Data::chip.soft_num, j = 0; i < Data::chip.soft_num + Data::chip.soft_num; i++, j++){  
+                fg[i+1] = y[j] + Data::chip.soft[j].height;             
+            }
+            // // cout << "eval2 : fg " << Data::Ch_list.size() + Data::Cv_list.size() + Data::nhe_list.size() + Data::nve_list.size() + Data::chip.soft_num << endl;
+            return;
+        }
+    };
+
+
+
+}
+//IP1()
+void IP1(void){
+    bool ok = true;
+    int nx = (Data::chip.soft_num )*2 , ng = 0;
+    typedef CPPAD_TESTVECTOR( double ) Dvector;
+    Dvector xi(nx);
+    // cout << Data::chip.width << ' ' << Data::chip.height << endl;
+    for (int i = 0; i < nx/2 ; i++){
+        for (int j = 0 ; j < 2; j++){
+            xi[i*2 + j] = j ? Data::chip.soft[i].center_y : Data::chip.soft[i].center_x;
+            // cout << i*2 + j << ' ' << xi[i*2 + j] <<endl;
+        }
+    }
+    // lower and upper limits for x
+    Dvector xl(nx), xu(nx);
+    for (int i = 0; i < nx/2 ; i++){
+        for (int j = 0 ; j < 2; j++){
+            xl[i*2 + j] = j ? Data::IP1_y1 + Data::chip.soft[i].r : Data::IP1_x1 + Data::chip.soft[i].r;
+            xu[i*2 + j] = j ? Data::IP1_y2 - Data::chip.soft[i].r : Data::IP1_x2 - Data::chip.soft[i].r;            
+            // cout << i*2 + j << ' ' << xi[i*2 + j] <<endl;
+        }
+    }    
+
+    // // lower and upper limits for g
+    Dvector gl(0), gu(0);
+    // gl[0] = double(temp[1]) ;
+    // gu[0] = double(temp[2]) ;
+    // gl[1] = temp[3];
+    // gu[1] = temp[4];
+
+    // object that computes objective and constraints
+    IP::FG_eval1 fg_eval;
+    //IP1()
+    // options
+    std::string options;
+    // options += "Retape  true\n";
+    // options += "String linear_solver   mumps\n";
+    // options += "String linear_solver   ma27\n";
+    // options += "String linear_solver   ma57\n";
+    // options += "String linear_solver   ma77\n";
+    // options += "String linear_solver   ma86\n";
+    options += "String linear_solver   ma97\n";
+    options += "String line_search_method    cg-penalty\n";
+    // options += "String warm_start_init_point   yes\n";
+    // options += "String warm_start_same_structure   yes\n";
+    // options += "Numeric findiff_perturbation   1e-3\n";
+    // options += "Numeric obj_scaling_factor   1e10\n";
+    // options += "Numeric obj_scaling_factor   100\n";
+    // options += "String hessian_approximation bayesian\n";
+    // options += "Numeric mu_inc 1.2\n";  
+    // options += "Numeric mu_red 0.9\n";
+    // turn off any printing
+    // options += "String nlp_scaling_method   none \n";
+    options += "Integer print_level   1 \n";
+    // options += "Integer file_print_level   6 \n";
+    // options += "String output_file myoutput.txt\n";
+    // options += "String check_derivatives_for_naninf   yes\n";
+    //options += "Integer print_level  0\n";
+    // options += "String  sb           yes\n";
+    // maximum number of iterations
+    // options += "String output_file myoutput.txt\n";
+    // options += "String check_derivatives_for_naninf   yes\n";
+
+    // options += "Integer acceptable_iter     100\n";
+    // approximate accuracy in first order necessary conditions;
+    // see Mathematical Programming, Volume 106, Number 1,
+    // Pages 25-57, Equation (6)
+    options += "Numeric tol          1e-8\n";
+    options += "Numeric acceptable_tol          1e-8\n";
+    // options += "Numeric max_wall_time          1e-10\n";
+    // options += "Numeric max_cpu_time          1e-10\n";
+    // options += "Numeric dual_inf_tol          1e-10\n";
+    // options += "Numeric constr_viol_tol          1e-10\n";
+    // options += "Numeric compl_inf_tol          1e-10\n";
+    options += "Integer max_iter 1000\n";
+    // options += "Integer acceptable_iter          1000\n";
+    // options += "Numeric acceptable_constr_viol_tol          1e-10\n";
+    // options += "Numeric acceptable_compl_inf_tol          1e-10\n";
+    // options += "Numeric acceptable_obj_change_tol          1e-10\n";
+    // options += "Numeric diverging_iterates_tol          1e-10\n";
+    // options += "Numeric mu_target          1e-10\n";
+
+    options += "String expect_infeasible_problem    yes\n";
+    // options += "String start_with_resto    yes\n";
+
+    options += "String mehrotra_algorithm           yes\n";
+
+
+
+    // options += "String jacobian_approximation     finite-difference-values\n";
+    // options += "String gradient_approximation      finite-difference-values\n";
+    // options += "String grad_f_constant    yes\n";
+    // options += "String jac_c_constant    yes\n";
+    // options += "String jac_d_constant    yes\n";
+    // options += "String hessian_constant    yes\n";
+    options += "String least_square_init_primal    yes\n";
+    // options += "String adaptive_mu_restore_previous_iterate    yes\n"; 
+    // options += "String accept_every_trial_step    yes\n"; 
+    
+
+    // options += "String nlp_scaling_method equilibration-based\n";
+    // options += "Integer nlp_scaling_max_gradient 1000\n";
+    // derivative testing
+    // options += "String  derivative_test            none\n";
+    options += "String  hessian_approximation            limited-memory\n";
+    options += "String  hessian_approximation_space             all-variables\n";
+    // options += "String  limited_memory_initialization             constant\n";
+    // options += "String  limited_memory_aug_solver             extended\n";
+    // options += "String  mehrotra_algorithm             no\n";
+    // maximum amount of random pertubation; e.g.,
+    // when evaluation finite diff
+    options += "Numeric point_perturbation_radius 0.\n";
+
+    // place to return solution
+    CppAD::ipopt::solve_result<Dvector> solution;
+
+    // // solve the problem
+    CppAD::ipopt::solve<Dvector, IP::FG_eval1>(
+            options, xi, xl, xu, gl, gu, fg_eval, solution
+    );
+
+    // for (int i =0; i < nx ; i++){
+    //     xi[i] = solution0.x[i];
+    // }   
+    // CppAD::ipopt::solve<Dvector, IP::FG_eval1>(
+    //         options, xi, xl, xu, gl, gu, fg_eval, solution
+    // );
+    Data::IP1_obj = solution.obj_value;
+    if (Data::IP1_min_obj > solution.obj_value){
+        Data::IP1_min_obj = solution.obj_value;
+        for (int i = 0; i < nx/2; i++){
+            for (int j = 0 ; j < 2 ; j++){
+                // cout << i*2 + j << ' ' << solution.x[i*2 + j] << ' ';
+                if (j){
+                    Data::temp_chip.soft[i].center_y = solution.x[i*2 + j];
+                }else{
+                    Data::temp_chip.soft[i].center_x = solution.x[i*2 + j];
+                }
+            }
+            // Data::temp_chip.soft[i].width = Data::chip.soft[i].r * 2;
+            // Data::temp_chip.soft[i].height = Data::chip.soft[i].r * 2;
+            // cout << endl;
+        }
+    }
+    // save the solution and change r to widthand height
+    for (int i = 0; i < nx/2; i++){
+        for (int j = 0 ; j < 2 ; j++){
+            // cout << i*2 + j << ' ' << solution.x[i*2 + j] << ' ';
+            if (j){
+                Data::chip.soft[i].center_y = solution.x[i*2 + j];
+            }else{
+                Data::chip.soft[i].center_x = solution.x[i*2 + j];
+            }
+        }
+        // Data::chip.soft[i].width = Data::chip.soft[i].r * 2;
+        // Data::chip.soft[i].height = Data::chip.soft[i].r * 2;
+        // cout << endl;
+    }
+    
+
+    // cout << solution.status << endl;
+    if (solution.status == CppAD::ipopt::solve_result<Dvector>::success){
+       Data::IP1_flag = true;
+    }
+    // //
+    // // Check some of the solution values
+    // //
+    // ok &= solution.status == CppAD::ipopt::solve_result<Dvector>::success;
+    // //
+    // double check_x[]  = { 1.000000, 4.743000, 3.82115, 1.379408 };
+    // double check_zl[] = { 1.087871, 0.,       0.,      0.       };
+    // double check_zu[] = { 0.,       0.,       0.,      0.       };
+    // double rel_tol    = 1e-6;  // relative tolerance
+    // double abs_tol    = 1e-6;  // absolute tolerance
+    // for(i = 0; i < nx; i++)
+    // {     ok &= CppAD::NearEqual(
+    //             check_x[i],  solution.x[i],   rel_tol, abs_tol
+    //     );
+    //     std::cout << check_x[i] << ", " << solution.x[i] << std::endl;
+    //     ok &= CppAD::NearEqual(
+    //             check_zl[i], solution.zl[i], rel_tol, abs_tol
+    //     );
+    //     ok &= CppAD::NearEqual(
+    //             check_zu[i], solution.zu[i], rel_tol, abs_tol
+    //     );
+    // }
+    // return ok;
+    return ;
+}
+
+//IP2()
+void IP2(void){
+    bool ok = true;
+    int nx = (Data::chip.soft_num )*4 ; // 0 => x, 1=>y, 3=> w ,4=>h
+    typedef CPPAD_TESTVECTOR( double ) Dvector;
+    Dvector xi(nx);
+    // cout << Data::chip.width << ' ' << Data::chip.height << endl;
+
+    // for (int i = 0; i < nx/4 ; i++){
+    //     for (int j = 0 ; j < 4; j++){
+    //         if (j == 0){
+    //             xi[i*4 + j] = Data::chip.soft[i].center_x;
+    //         }else if (j == 1){
+    //             xi[i*4 + j] = Data::chip.soft[i].center_y;
+    //         }else if (j == 2){
+    //             xi[i*4 + j] = Data::chip.soft[i].width;
+    //         }else{
+    //             xi[i*4 + j] = Data::chip.soft[i].height;
+    //         }
+    //         // cout << i*4 + j << ' ' << xi[i*4 + j]  << endl;
+    //     }
+    //     // cout << endl;
+    // }
+    // // lower and upper limits for x
+    // Dvector xl(nx), xu(nx);
+    // for (int i = 0; i < nx/4 ; i++){
+    //     for (int j = 0 ; j < 4; j++){
+    //         if (j == 0){ // x
+    //             xl[i*4 + j] = 0;
+    //             xu[i*4 + j] = Data::chip.width;
+    //         }else if (j == 1){ // y
+    //             xl[i*4 + j] = 0;
+    //             xu[i*4 + j] = Data::chip.height;
+    //         }else if (j == 2){ // w
+    //             xl[i*4 + j] = round(sqrt(Data::chip.soft[i].lA/2)) ;
+    //             xu[i*4 + j] = Data::chip.width;
+    //         }else{ // h
+    //             xl[i*4 + j] = round(sqrt(Data::chip.soft[i].lA/2)) ;
+    //             xu[i*4 + j] = Data::chip.height;
+    //         }
+    //     }
+    // }
+
+    for (int i = 0; i < nx/4 ; i++){
+        for (int j = 0 ; j < 2; j++){
+            if (j == 0){
+                xi[i*2 + j] = Data::chip.soft[i].center_x;
+            }else if (j == 1){
+                xi[i*2 + j] = Data::chip.soft[i].center_y;
+            }
+            // cout << i*4 + j << ' ' << xi[i*4 + j]  << endl;
+        }
+        // cout << endl;
+    }
+    for (int i = 0; i < nx/4 ; i++){
+        for (int j = 0 ; j < 2; j++){
+            if (j == 0){
+                xi[i*2 + j + Data::chip.soft_num*2] = Data::chip.soft[i].width;
+            }else{
+                xi[i*2 + j + Data::chip.soft_num*2] = Data::chip.soft[i].height;
+            }
+            // cout << i*4 + j << ' ' << xi[i*4 + j]  << endl;
+        }
+        // cout << endl;
+    }
+    // lower and upper limits for x
+    Dvector xl(nx), xu(nx);
+    for (int i = 0; i < nx/4 ; i++){
+        for (int j = 0 ; j < 2; j++){
+            if (j == 0){ // x
+                xl[i*2 + j] = 0;
+                xu[i*2 + j] = Data::chip.width;
+            }else if (j == 1){ // y
+                xl[i*2 + j] = 0;
+                xu[i*2 + j] = Data::chip.height;
+            }
+        }
+    }
+    for (int i = 0; i < nx/4 ; i++){
+        for (int j = 0 ; j < 2; j++){
+            if (j == 0){ // w
+                xl[i*2 + j + Data::chip.soft_num*2] = round(sqrt(Data::chip.soft[i].lA/2)) ;
+                xu[i*2 + j + Data::chip.soft_num*2] = Data::chip.width;
+            }else{ // h
+                xl[i*2 + j + Data::chip.soft_num*2] = round(sqrt(Data::chip.soft[i].lA/2)) ;
+                xu[i*2 + j + Data::chip.soft_num*2] = Data::chip.height;
+            }
+        }
+    }
+    // // lower and upper limits for g
+    // int ng = Data::Ch_list.size() + Data::Cv_list.size() + Data::nhe_list.size() + Data::nve_list.size() + Data::chip.soft_num;
+    // int ng = Data::Ch_list.size() + Data::Cv_list.size() + Data::nhe_list.size() + Data::nve_list.size() ;
+    // int ng = Data::Ch_list.size() + Data::Cv_list.size()  + Data::chip.soft_num ;
+    int ng = Data::Ch_list.size() + Data::Cv_list.size()   + 4* Data::chip.soft_num;
+    Dvector gl(ng), gu(ng);
+    //Ch
+    for (int i = 0; i < Data::Ch_list.size(); i++){ 
+        // gl[i] = (-1)* Data::chip.width ; // can change
+        gl[i] = Data::Ch_list[i].a < Data::chip.soft_num ? (-1) *Data::chip.soft[Data::Ch_list[i].a].width :(-1) * Data::chip.fixed[Data::Ch_list[i].a-Data::chip.soft_num].width;
+        // if (Data::Ch_list[i].a < Data::chip.soft_num){
+        //     gl[i] = Data::Ch_list[i].b < Data::chip.soft_num ? 10 * (Data::chip.soft[Data::Ch_list[i].a].center_x  - Data::chip.soft[Data::Ch_list[i].b].center_x)  : 10*  (Data::chip.soft[Data::Ch_list[i].a].center_x   -  Data::chip.fixed[Data::Ch_list[i].b-Data::chip.soft_num].center_x);
+        // }else{
+        //     gl[i] = Data::Ch_list[i].b < Data::chip.soft_num ? 10 * ( Data::chip.fixed[Data::Ch_list[i].a-Data::chip.soft_num].center_x  -  Data::chip.soft[Data::Ch_list[i].b].center_x ):10 * (Data::chip.fixed[Data::Ch_list[i].a-Data::chip.soft_num].center_x   -  Data::chip.fixed[Data::Ch_list[i].b-Data::chip.soft_num].center_x);
+        // }
+        gu[i] = 0;
+    }
+    //Cv
+    for (int i = Data::Ch_list.size(), j = 0; i < Data::Ch_list.size() + Data::Cv_list.size(); i++, j++){ 
+        // gl[i] = (-1) * Data::chip.height ; // can change
+        gl[i] = Data::Cv_list[j].a < Data::chip.soft_num ? (-1) * Data::chip.soft[Data::Cv_list[j].a].height :(-1) *  Data::chip.fixed[Data::Cv_list[j].a-Data::chip.soft_num].height;
+        
+        // if (Data::Cv_list[j].a < Data::chip.soft_num){
+        //     gl[i] = Data::Cv_list[j].b < Data::chip.soft_num ? 2 * (Data::chip.soft[Data::Cv_list[j].a].center_y   - Data::chip.soft[Data::Cv_list[j].b].center_y ) : 2 * (Data::chip.soft[Data::Cv_list[j].a].center_y   -  Data::chip.fixed[Data::Cv_list[j].b-Data::chip.soft_num].center_y);
+        // }else{
+        //     gl[i] = Data::Cv_list[j].b < Data::chip.soft_num ? 2 *  (Data::chip.fixed[Data::Cv_list[j].a-Data::chip.soft_num].center_y   -Data::chip.soft[Data::Cv_list[j].b].center_y) : 2 * (Data::chip.fixed[Data::Cv_list[j].a-Data::chip.soft_num].center_y   -  Data::chip.fixed[Data::Cv_list[j].b-Data::chip.soft_num].center_y);
+        // }
+        
+        gu[i] = 0;
+    }
+
+    
+    // soft A
+    for (int i = Data::Ch_list.size() + Data::Cv_list.size(), j = 0 ; i < Data::Ch_list.size() + Data::Cv_list.size() + Data::chip.soft_num; i++, j++){ 
+        gl[i] =  1.1 * Data::chip.soft[j].lA;
+        gu[i] = 2 * Data::chip.soft[j].lA;
+    }
+    //a ratio
+    for (int i = Data::Ch_list.size() + Data::Cv_list.size() + Data::chip.soft_num, j = 0; i < Data::Ch_list.size() + Data::Cv_list.size() + Data::chip.soft_num + Data::chip.soft_num; i++, j++){  
+        gl[i] = 0.6 ;
+        gu[i] = 1.9;
+    }
+    //Nhe
+    for (int i = Data::Ch_list.size() + Data::Cv_list.size() + Data::chip.soft_num + Data::chip.soft_num, j = 0; i <Data::Ch_list.size() + Data::Cv_list.size() + Data::chip.soft_num + Data::chip.soft_num + Data::chip.soft_num; i++, j++){ 
+        gl[i] = 0;
+        gu[i] = Data::chip.width;
+    }    
+    // Nve
+    for (int i = Data::Ch_list.size() + Data::Cv_list.size() + Data::chip.soft_num + Data::chip.soft_num+ Data::chip.soft_num, j = 0; i <Data::Ch_list.size() + Data::Cv_list.size() + Data::chip.soft_num + Data::chip.soft_num + Data::chip.soft_num+ Data::chip.soft_num; i++, j++){ 
+        gl[i] = 0 ;
+        gu[i] = Data::chip.height;
+    }
+
+
+    // object that computes objective and constraints
+    IP::FG_eval2 fg_eval;
+    //IP2()
+    // options
+    std::string options;
+    // options += "Retape  true\n";
+    // options += "String linear_solver   mumps\n";
+    options += "String linear_solver   ma97\n";
+    // options += "String linear_system_scaling   none\n";
+    options += "String mu_strategy   adaptive\n";
+    // options += "Numeric mu_max_fact          1e1\n";
+    // options += "Numeric mu_max          1e1\n";
+    // options += "Numeric mu_min          1e-11\n";
+    // options += "Numeric mu_max_fact          1e-10\n";
+    // options += "String adaptive_mu_globalization    kkt-error\n";
+    // options += "Numeric adaptive_mu_kkterror_red_iters    10\n";
+    // options += "Numeric adaptive_mu_kkterror_red_fact     10\n";
+    // options += "String adaptive_mu_kkt_norm_type     1-norm\n";
+    // options += "String adaptive_mu_globalization    obj-constr-filter\n";
+    // options += "Numeric filter_margin_fact    0.1\n";
+    // options += "Numeric filter_max_margin    10\n";
+    // options += "String adaptive_mu_restore_previous_iterate    yes\n";
+    // options += "String adaptive_mu_monotone_init_factor    obj-constr-filter\n";
+    // options += "String mu_oracle    probing\n";
+    // options += "Numeric sigma_max    1e-1\n";
+    // options += "Numeric mu_target    1e1\n";
+
+    // options += "String start_with_resto    yes\n";
+
+
+    // options += "String line_search_method    cg-penalty\n";
+    // options += "Numeric accept_after_max_steps     100\n";
+
+
+    // options += "String jacobian_approximation     finite-difference-values\n";
+    // options += "String gradient_approximation      finite-difference-values\n";
+    // options += "String grad_f_constant    yes\n";
+    // options += "String jac_c_constant    yes\n";
+    // options += "String jac_d_constant    yes\n";
+    // options += "String hessian_constant    yes\n";
+    // options += "String least_square_init_primal    yes\n";
+    // options += "String adaptive_mu_restore_previous_iterate    yes\n"; 
+    // options += "String accept_every_trial_step    yes\n"; 
+    
+
+    options += "String expect_infeasible_problem    yes\n";
+    options += "String start_with_resto    yes\n";
+    // options += "String replace_bounds    yes\n";
+
+    // options += "Numeric expect_infeasible_problem_ctol     1e-5\n";
+    // options += "Numeric expect_infeasible_problem_ytol     1e5\n";
+
+    // options += "Numeric soft_resto_pderror_reduction_factor     0.9999\n";
+    // options += "Numeric max_soft_resto_iters     1e1\n";
+    // options += "Numeric required_infeasibility_reduction     0.5\n";
+    // options += "Numeric max_resto_iter     50000000\n";
+
+
+    // options += "Numeric evaluate_orig_obj_at_resto_trial     1e-3\n";
+    // options += "Numeric resto_penalty_parameter     1e8\n";
+    // options += "Numeric resto_proximity_weight     1e5\n";
+    // options += "Numeric bound_mult_reset_threshold     1e5\n";x
+    // options += "Numeric constr_mult_reset_threshold     1e3\n";x
+    // options += "Numeric resto_failure_feasibility_threshold     1e2\n";
+
+
+    // options += "String honor_original_bounds    yes\n";
+
+
+
+    // options += "String least_square_init_duals    yes\n";x
+    // options += "String alpha_for_y    min\n";
+    // options += "Numeric alpha_for_y_tol   1e-5 \n";
+    // options += "String fixed_variable_treatment    relax_bounds\n";
+    // options += "String derivative_test    second-order\n";
+    // options += "String least_square_init_primal    yes\n";
+    options += "String ma97_order    best\n";
+    options += "String ma97_solve_blas3     yes\n";
+    // options += "String  limited_memory_aug_solver             extended\n";
+
+    // options += "String nlp_scaling_method    user-scaling\n";
+
+    // turn off any printing
+    options += "Integer print_level   5\n";
+    // options += "String output_file myoutput.txt\n";
+    // options += "String check_derivatives_for_naninf   yes\n";
+    // options += "Integer file_print_level  7\n";
+    // options += "String  sb           yes\n";
+    // maximum number of iterations
+    options += "Integer max_iter     100\n";
+    // options += "Numeric bound_push     100\n";
+    // options += "Numeric bound_frac     1e-3\n";
+
+
+    // options += "Numeric mu_init          1e-5\n";
+    // options += "Numeric barrier_tol_factor     1e5\n";
+    // options += "Numeric mu_linear_decrease_factor     0.01\n";
+    // options += "Numeric mu_superlinear_decrease_power     1.99\n";
+    // options += "String mu_allow_fast_monotone_decrease     no\n";
+
+
+    // approximate accuracy in first order necessary conditions;
+    // see Mathematical Programming, Volume 106, Number 1,
+    // Pages 25-57, Equation (6)
+    // options += "String  hessian_approximation            limited-memory\n";
+    // options += "String  hessian_approximation_space             all-variables\n";
+    options += "Numeric tol          1e-8\n";
+    options += "Numeric acceptable_tol          1e-8\n";
+    // options += "Numeric nlp_lower_bound_inf          0\n";
+    // options += "Numeric nlp_upper_bound_inf          1e20\n";
+    // options += "Numeric acceptable_obj_change_tol          1e3\n";
+
+
+    // options += "Numeric gamma_theta          1e-2\n";
+    // options += "Numeric gamma_phi           1e-2\n";
+    // options += "Numeric theta_max_fact           1e8\n";
+    // options += "Numeric theta_min_fact           1e-8\n";
+    // options += "Numeric eta_phi           1e2\n";
+    // options += "Numeric delta           1e2\n";
+    // options += "Numeric s_phi           1e2\n";
+    // options += "Numeric s_theta           1e2\n";
+    // options += "String recalc_y           yes\n";
+
+
+    // options += "String mehrotra_algorithm           yes\n";
+    // options += "String mehrotra_algorithm           no\n";
+
+
+    // options += "String constraint_violation_norm_type           2-norm\n";
+
+
+    // options += "Numeric soft_resto_pderror_reduction_factor          0\n";
+    // options += "Numeric dual_inf_tol          1e-5\n";
+    // options += "Numeric constr_viol_tol          1e-1\n";
+    // options += "Numeric compl_inf_tol          1e-1\n";
+    
+    // options += "Numeric alpha_min_frac          0.5\n";
+    // options += "Numeric nlp_scaling_max_gradient   1e-5\n";
+    // options += "String bound_mult_init_method         mu-based\n";
+    // options += "Numeric bound_mult_init_val          1e3\n";
+
+
+    // options += "Numeric findiff_perturbation           1e-5\n";
+    // options += "Numeric constr_viol_tol          1e-3\n";
+    // options += "Numeric bound_relax_factor          0\n";
+    // options += "Numeric nlp_scaling_constr_target_gradient          1e2\n";
+    // options += "Numeric constr_mult_init_max          1e1\n";
+    // options += "Numeric acceptable_tol          1e-10\n";
+    // derivative testing
+    // options += "String  derivative_test            none\n";
+    // maximum amount of random pertubation; e.g.,
+    // when evaluation finite diff
+    // options += "Numeric point_perturbation_radius  1e0\n";
+
+    // place to return solution
+    CppAD::ipopt::solve_result<Dvector> solution;
+    // cout << "IP2 : nx " << nx << " ng" << ng << endl;
+    // cout << "eval2 : fg " << Data::Ch_list.size() + Data::Cv_list.size() + Data::nhe_list.size() + Data::nve_list.size() + Data::chip.soft_num << endl;
+    // // solve the problem
+    
+    CppAD::ipopt::solve<Dvector, IP::FG_eval2>(
+            options, xi, xl, xu, gl, gu, fg_eval, solution
+    );
+    
+    // // save the solution and change r to widthand height
+    // ok &= solution.status == CppAD::ipopt::solve_result<Dvector>::success;
+    // for (int i = 0; i < nx/4; i++){
+    //     for (int j = 0 ; j < 4 ; j++){
+    //         // cout << i*4 + j << ' ' << solution.x[i*4 + j] << ' ';
+    //         if (j == 0){
+    //             Data::chip.soft[i].center_x = solution.x[i*4 + j];
+    //         }else if(j == 1){
+    //             Data::chip.soft[i].center_y = solution.x[i*4 + j];
+    //         }else if(j == 2){
+    //             Data::chip.soft[i].width = solution.x[i*4 + j];
+    //         }else if(j == 3){
+    //             Data::chip.soft[i].height = solution.x[i*4 + j];
+    //         }
+    //         // cout << i*4+j << ' ';
+    //     }
+    //     // cout << endl;
+    // }
+
+    for (int i = 0; i < nx/4; i++){
+        for (int j = 0 ; j < 2 ; j++){
+            // cout << i*4 + j << ' ' << solution.x[i*4 + j] << ' ';
+            if (j == 0){
+                Data::chip.soft[i].center_x = solution.x[i*2 + j];
+            }else if(j == 1){
+                Data::chip.soft[i].center_y = solution.x[i*2 + j];
+            }
+            // cout << i*4+j << ' ';
+        }
+        // cout << endl;
+    }
+
+    for (int i = 0; i < nx/4; i++){
+        for (int j = 0 ; j < 2 ; j++){
+            // cout << i*4 + j << ' ' << solution.x[i*4 + j] << ' ';
+            if(j == 2){
+                Data::chip.soft[i].width = solution.x[i*2 + j + nx/2];
+            }else if(j == 3){
+                Data::chip.soft[i].height = solution.x[i*2 + j + nx/2];
+            }
+            // cout << i*4+j << ' ';
+        }
+        // cout << endl;
+    }
+    Data::IP2_last_obj = solution.obj_value;
+    Data::IP2_last_type = -1;
+    
+    return ;
+}
+
+//IP20()
+void IP20(void){
+    int nx = (Data::chip.soft_num )*2 ;
+    typedef CPPAD_TESTVECTOR( double ) Dvector;
+    Dvector xi(nx);
+    // cout << Data::chip.width << ' ' << Data::chip.height << endl;
+    for (int i = 0; i < nx/2 ; i++){
+        for (int j = 0 ; j < 2; j++){
+            xi[i*2 + j] = j ? Data::chip.soft[i].center_y : Data::chip.soft[i].center_x;
+            // cout << i*2 + j << ' ' << xi[i*2 + j] <<endl;
+        }
+    }
+    // lower and upper limits for x
+    Dvector xl(nx), xu(nx);
+    for (int i = 0; i < nx/2 ; i++){
+        for (int j = 0 ; j < 2; j++){
+            if (j == 0){ // x
+                xl[i*2 + j] = 0;
+                xu[i*2 + j] = Data::chip.width;
+            }else if (j == 1){ // y
+                xl[i*2 + j] = 0;
+                xu[i*2 + j] = Data::chip.height;
+            }
+        }
+    }
+
+
+    // // lower and upper limits for g
+    // int ng = Data::Ch_list.size() + Data::Cv_list.size() + Data::nhe_list.size() + Data::nve_list.size() + Data::chip.soft_num;
+    // int ng = Data::Ch_list.size() + Data::Cv_list.size() + Data::nhe_list.size() + Data::nve_list.size() ;
+    // int ng = Data::Ch_list.size() + Data::Cv_list.size()  + Data::chip.soft_num ;
+    int ng = Data::Ch_list.size() + Data::Cv_list.size()   + 2* Data::chip.soft_num;
+    Dvector gl(ng), gu(ng);
+    //Ch
+    for (int i = 0; i < Data::Ch_list.size(); i++){ 
+        gl[i] = (-1)* Data::chip.width ; // can change
+        // gu[i] = Data::Ch_list[i].b < Data::chip.soft_num ? Data::chip.soft[Data::Ch_list[i].b].center_x : Data::chip.fixed[Data::Ch_list[i].b-Data::chip.soft_num].center_x;
+        gu[i] = 0;
+    }
+    //Cv
+    for (int i = Data::Ch_list.size(), j = 0; i < Data::Ch_list.size() + Data::Cv_list.size(); i++, j++){ 
+        gl[i] = (-1) * Data::chip.height ; // can change
+        // gu[i] = Data::Cv_list[j].b < Data::chip.soft_num ? Data::chip.soft[Data::Cv_list[j].b].center_y : Data::chip.fixed[Data::Cv_list[j].b-Data::chip.soft_num].center_y;
+        gu[i] = 0;
+    }
+    //Nhe
+    for (int i = Data::Ch_list.size() + Data::Cv_list.size(), j = 0 ; i < Data::Ch_list.size() + Data::Cv_list.size() + Data::chip.soft_num; i++, j++){ 
+        gl[i] = 0 ;
+        gu[i] = Data::chip.width;
+    }
+    // Nve
+    for (int i = Data::Ch_list.size() + Data::Cv_list.size() + Data::chip.soft_num, j = 0; i < Data::Ch_list.size() + Data::Cv_list.size() + Data::chip.soft_num + Data::chip.soft_num; i++, j++){  
+        gl[i] = 0 ;
+        gu[i] = Data::chip.height;
+    }
+    // object that computes objective and constraints
+    IP::FG_eval20 fg_eval;
+    //IP20()
+    // options
+    std::string options;
+    // options += "Retape  true\n";
+    // options += "String linear_solver   mumps\n";
+    options += "String linear_solver   ma97\n";
+    // options += "String linear_system_scaling   none\n";
+    options += "String mu_strategy   adaptive\n";
+    // options += "Numeric mu_max_fact          1e1\n";
+    // options += "Numeric mu_max          1e1\n";
+    // options += "Numeric mu_min          1e-11\n";
+    // options += "Numeric mu_max_fact          1e-10\n";
+    // options += "String adaptive_mu_globalization    kkt-error\n";
+    // options += "Numeric adaptive_mu_kkterror_red_iters    10\n";
+    // options += "Numeric adaptive_mu_kkterror_red_fact     10\n";
+    // options += "String adaptive_mu_kkt_norm_type     1-norm\n";
+    // options += "String adaptive_mu_globalization    obj-constr-filter\n";
+    // options += "Numeric filter_margin_fact    0.1\n";
+    // options += "Numeric filter_max_margin    10\n";
+    // options += "String adaptive_mu_restore_previous_iterate    yes\n";
+    // options += "String adaptive_mu_monotone_init_factor    obj-constr-filter\n";
+    // options += "String mu_oracle    probing\n";
+    // options += "Numeric sigma_max    1e-1\n";
+    // options += "Numeric mu_target    1e1\n";
+
+    // options += "String start_with_resto    yes\n";
+
+
+    // options += "String line_search_method    cg-penalty\n";
+    // options += "Numeric accept_after_max_steps     100\n";
+
+
+    // options += "String jacobian_approximation     finite-difference-values\n";
+    // options += "String gradient_approximation      finite-difference-values\n";
+    // options += "String grad_f_constant    yes\n";
+    // options += "String jac_c_constant    yes\n";
+    // options += "String jac_d_constant    yes\n";
+    // options += "String hessian_constant    yes\n";
+    // options += "String least_square_init_primal    yes\n";
+    // options += "String adaptive_mu_restore_previous_iterate    yes\n"; 
+    // options += "String accept_every_trial_step    yes\n"; 
+    
+
+    options += "String expect_infeasible_problem    yes\n";
+    options += "String start_with_resto    yes\n";
+    // options += "String replace_bounds    yes\n";
+
+    // options += "Numeric expect_infeasible_problem_ctol     1e-3\n";
+    // options += "Numeric expect_infeasible_problem_ytol     1e1\n";
+
+    // options += "Numeric soft_resto_pderror_reduction_factor     0.9999\n";
+    // options += "Numeric max_soft_resto_iters     1e1\n";
+    // options += "Numeric required_infeasibility_reduction     0.9\n";
+    // options += "Numeric max_resto_iter     3000000\n";
+
+
+    // options += "Numeric evaluate_orig_obj_at_resto_trial     1e-3\n";
+    // options += "Numeric resto_penalty_parameter     1e5\n";
+    // options += "Numeric resto_proximity_weight     1e5\n";
+    // options += "Numeric bound_mult_reset_threshold     1e3\n";
+    // options += "Numeric constr_mult_reset_threshold     1e1\n";
+    // options += "Numeric resto_failure_feasibility_threshold     1e1\n";
+
+
+    // options += "String honor_original_bounds    yes\n";
+
+
+
+    // options += "String least_square_init_duals    yes\n";
+    // options += "String alpha_for_y    min\n";
+    // options += "Numeric alpha_for_y_tol   1e-5 \n";
+    // options += "String fixed_variable_treatment    relax_bounds\n";
+    // options += "String derivative_test    second-order\n";
+    // options += "String least_square_init_primal    yes\n";
+    options += "String ma97_order    best\n";
+    options += "String ma97_solve_blas3     yes\n";
+    // options += "String  limited_memory_aug_solver             extended\n";
+
+    // options += "String nlp_scaling_method    equilibration-based\n";
+
+    // turn off any printing
+    options += "Integer print_level   0\n";
+    // options += "String output_file myoutput.txt\n";
+    // options += "String check_derivatives_for_naninf   yes\n";
+    // options += "Integer file_print_level  7\n";
+    // options += "String  sb           yes\n";
+    // maximum number of iterations
+    options += "Integer max_iter     10\n";
+    // options += "Numeric bound_push     1\n";
+    // options += "Numeric bound_frac     1e-1\n";
+
+
+    // options += "Numeric mu_init          0.001\n";
+    // options += "Numeric barrier_tol_factor     1000\n";
+    // options += "Numeric mu_linear_decrease_factor     0.01\n";
+    // options += "Numeric mu_superlinear_decrease_power     1.99\n";
+    // options += "String mu_allow_fast_monotone_decrease     no\n";
+
+
+    // approximate accuracy in first order necessary conditions;
+    // see Mathematical Programming, Volume 106, Number 1,
+    // Pages 25-57, Equation (6)
+    // options += "String  hessian_approximation            limited-memory\n";
+    // options += "String  hessian_approximation_space             all-variables\n";
+    options += "Numeric tol          1e-8\n";
+    options += "Numeric acceptable_tol          1e-8\n";
+    // options += "Numeric acceptable_obj_change_tol          1e-8\n";
+
+
+    // options += "Numeric gamma_theta          1e-2\n";
+    // options += "Numeric gamma_phi           1e-2\n";
+    // options += "Numeric theta_max_fact           1e8\n";
+    // options += "Numeric theta_min_fact           1e-8\n";
+    // options += "Numeric eta_phi           1e2\n";
+    // options += "Numeric delta           1e2\n";
+    // options += "Numeric s_phi           1e2\n";
+    // options += "Numeric s_theta           1e2\n";
+    // options += "String recalc_y           yes\n";
+
+    // options += "String mehrotra_algorithm           yes\n";
+    // options += "String mehrotra_algorithm           no\n";
+
+
+    // options += "String constraint_violation_norm_type           max-norm\n";
+
+
+    // options += "Numeric soft_resto_pderror_reduction_factor          0\n";
+    // options += "Numeric dual_inf_tol          1e-5\n";
+    // options += "Numeric constr_viol_tol          1e-1\n";
+    // options += "Numeric compl_inf_tol          1e-1\n";
+    
+    // options += "Numeric alpha_min_frac          0.5\n";
+    // options += "Numeric nlp_scaling_max_gradient   1e-5\n";
+    // options += "String bound_mult_init_method         mu-based\n";
+    // options += "Numeric bound_mult_init_val          1e3\n";
+
+    // options += "Numeric findiff_perturbation           1e-5\n";
+    // options += "Numeric constr_viol_tol          1e-3\n";
+    // options += "Numeric bound_relax_factor          0\n";
+    // options += "Numeric nlp_scaling_constr_target_gradient          1e2\n";
+    // options += "Numeric constr_mult_init_max          1e1\n";
+    // options += "Numeric acceptable_tol          1e-10\n";
+    // derivative testing
+    // options += "String  derivative_test            none\n";
+    // maximum amount of random pertubation; e.g.,
+    // when evaluation finite diff
+    // options += "Numeric point_perturbation_radius  1e3\n";
+
+    // place to return solution
+    CppAD::ipopt::solve_result<Dvector> solution;
+    // cout << "IP2 : nx " << nx << " ng" << ng << endl;
+    // cout << "eval2 : fg " << Data::Ch_list.size() + Data::Cv_list.size() + Data::nhe_list.size() + Data::nve_list.size() + Data::chip.soft_num << endl;
+    // // solve the problem
+    
+    CppAD::ipopt::solve<Dvector, IP::FG_eval20>(
+            options, xi, xl, xu, gl, gu, fg_eval, solution
+    );
+    
+    // // save the solution and change r to widthand height
+    // ok &= solution.status == CppAD::ipopt::solve_result<Dvector>::success;
+    for (int i = 0; i < nx/2; i++){
+        for (int j = 0 ; j < 2 ; j++){
+            // cout << i*4 + j << ' ' << solution.x[i*4 + j] << ' ';
+            if (j == 0){
+                Data::chip.soft[i].center_x = solution.x[i*2 + j];
+            }else if(j == 1){
+                Data::chip.soft[i].center_y = solution.x[i*2 + j];
+            }
+            // cout << i*4+j << ' ';
+        }
+        // cout << endl;
+    }
+    Data::IP2_last_obj = solution.obj_value;
+    Data::IP2_last_type = 0;
+    
+    return ;
+}
+
+
+//IP21()
+void IP21(void){
+    int nx = (Data::chip.soft_num )*2 ;
+    typedef CPPAD_TESTVECTOR( double ) Dvector;
+    Dvector xi(nx);
+    // cout << Data::chip.width << ' ' << Data::chip.height << endl;
+    for (int i = 0; i < nx/2 ; i++){
+        for (int j = 0 ; j < 2; j++){
+            xi[i*2 + j] = j ? Data::chip.soft[i].height : Data::chip.soft[i].width;
+            // cout << i*2 + j << ' ' << xi[i*2 + j] <<endl;
+        }
+    }
+    // lower and upper limits for x
+    Dvector xl(nx), xu(nx);
+    for (int i = 0; i < nx/2 ; i++){
+        for (int j = 0 ; j < 2; j++){
+            if (j == 0){ // x
+                xl[i*2 + j] = round(sqrt(Data::chip.soft[i].lA/2));
+                xu[i*2 + j] = Data::chip.width;
+            }else if (j == 1){ // y
+                xl[i*2 + j] = round(sqrt(Data::chip.soft[i].lA/2));
+                xu[i*2 + j] = Data::chip.height;
+            }
+        }
+    }
+
+    // // lower and upper limits for g
+    // int ng = Data::Ch_list.size() + Data::Cv_list.size() + Data::nhe_list.size() + Data::nve_list.size() + Data::chip.soft_num;
+    // int ng = Data::Ch_list.size() + Data::Cv_list.size() + Data::nhe_list.size() + Data::nve_list.size() ;
+    // int ng = Data::Ch_list.size() + Data::Cv_list.size()  + Data::chip.soft_num ;
+    int ng = Data::Ch_list.size() + Data::Cv_list.size()   + 4* Data::chip.soft_num;
+    Dvector gl(ng), gu(ng);
+    //Ch
+    for (int i = 0; i < Data::Ch_list.size(); i++){ 
+        gl[i] = (-0.5)* Data::chip.width ; // can change
+        // gu[i] = Data::Ch_list[i].b < Data::chip.soft_num ? Data::chip.soft[Data::Ch_list[i].b].center_x : Data::chip.fixed[Data::Ch_list[i].b-Data::chip.soft_num].center_x;
+        gu[i] = 0;
+    }
+    //Cv
+    for (int i = Data::Ch_list.size(), j = 0; i < Data::Ch_list.size() + Data::Cv_list.size(); i++, j++){ 
+        gl[i] = (-0.5) * Data::chip.height ; // can change
+        // gu[i] = Data::Cv_list[j].b < Data::chip.soft_num ? Data::chip.soft[Data::Cv_list[j].b].center_y : Data::chip.fixed[Data::Cv_list[j].b-Data::chip.soft_num].center_y;
+        gu[i] = 0;
+    }
+    // soft A
+    for (int i = Data::Ch_list.size() + Data::Cv_list.size(), j = 0 ; i < Data::Ch_list.size() + Data::Cv_list.size() + Data::chip.soft_num; i++, j++){ 
+        gl[i] =  1.1*Data::chip.soft[j].lA;
+        gu[i] = 1.5*Data::chip.soft[j].lA;
+    }
+    //a ratio
+    for (int i = Data::Ch_list.size() + Data::Cv_list.size() + Data::chip.soft_num, j = 0; i < Data::Ch_list.size() + Data::Cv_list.size() + Data::chip.soft_num + Data::chip.soft_num; i++, j++){  
+        gl[i] = 0.6 ;
+        gu[i] = 1.9;
+    }
+    //Nhe
+    for (int i = Data::Ch_list.size() + Data::Cv_list.size() + Data::chip.soft_num + Data::chip.soft_num, j = 0; i <Data::Ch_list.size() + Data::Cv_list.size() + Data::chip.soft_num + Data::chip.soft_num + Data::chip.soft_num; i++, j++){ 
+        gl[i] = 0 ;
+        gu[i] = Data::chip.width;
+    }    
+    // Nve
+    for (int i = Data::Ch_list.size() + Data::Cv_list.size() + Data::chip.soft_num + Data::chip.soft_num, j = 0; i <Data::Ch_list.size() + Data::Cv_list.size() + Data::chip.soft_num + Data::chip.soft_num + Data::chip.soft_num; i++, j++){ 
+        gl[i] = 0 ;
+        gu[i] = Data::chip.height;
+    }
+
+
+    // object that computes objective and constraints
+    IP::FG_eval21 fg_eval;
+    //IP21()
+    // options
+    std::string options;
+    // options += "Retape  true\n";
+    // options += "String linear_solver   mumps\n";
+    options += "String linear_solver   ma97\n";
+    // options += "String linear_system_scaling   none\n";
+    options += "String mu_strategy   adaptive\n";
+    // options += "Numeric mu_max_fact          1e1\n";
+    // options += "Numeric mu_max          1e1\n";
+    // options += "Numeric mu_min          1e-11\n";
+    // options += "Numeric mu_max_fact          1e-10\n";
+    // options += "String adaptive_mu_globalization    kkt-error\n";
+    // options += "Numeric adaptive_mu_kkterror_red_iters    10\n";
+    // options += "Numeric adaptive_mu_kkterror_red_fact     10\n";
+    // options += "String adaptive_mu_kkt_norm_type     1-norm\n";
+    // options += "String adaptive_mu_globalization    obj-constr-filter\n";
+    // options += "Numeric filter_margin_fact    0.1\n";
+    // options += "Numeric filter_max_margin    10\n";
+    // options += "String adaptive_mu_restore_previous_iterate    yes\n";
+    // options += "String adaptive_mu_monotone_init_factor    obj-constr-filter\n";
+    // options += "String mu_oracle    probing\n";
+    // options += "Numeric sigma_max    1e-1\n";
+    // options += "Numeric mu_target    1e1\n";
+
+    // options += "String start_with_resto    yes\n";
+
+
+    // options += "String line_search_method    cg-penalty\n";
+    // options += "Numeric accept_after_max_steps     100\n";
+
+
+    // options += "String jacobian_approximation     finite-difference-values\n";
+    // options += "String gradient_approximation      finite-difference-values\n";
+    // options += "String grad_f_constant    yes\n";
+    // options += "String jac_c_constant    yes\n";
+    // options += "String jac_d_constant    yes\n";
+    // options += "String hessian_constant    yes\n";
+    // options += "String least_square_init_primal    yes\n";
+    // options += "String adaptive_mu_restore_previous_iterate    yes\n"; 
+    // options += "String accept_every_trial_step    yes\n"; 
+    
+
+    options += "String expect_infeasible_problem    yes\n";
+    options += "String start_with_resto    yes\n";
+
+    // options += "Numeric expect_infeasible_problem_ctol     1e-3\n";
+    // options += "Numeric expect_infeasible_problem_ytol     1e1\n";
+
+    // options += "Numeric soft_resto_pderror_reduction_factor     0.9999\n";
+    // options += "Numeric max_soft_resto_iters     1e1\n";
+    // options += "Numeric required_infeasibility_reduction     0.9\n";
+    // options += "Numeric max_resto_iter     3000000\n";
+
+
+    // options += "Numeric evaluate_orig_obj_at_resto_trial     1e-3\n";
+    // options += "Numeric resto_penalty_parameter     1e5\n";
+    // options += "Numeric resto_proximity_weight     1e5\n";
+    // options += "Numeric bound_mult_reset_threshold     1e3\n";
+    // options += "Numeric constr_mult_reset_threshold     1e1\n";
+    // options += "Numeric resto_failure_feasibility_threshold     1e1\n";
+
+
+    options += "String honor_original_bounds    yes\n";
+
+
+
+    // options += "String least_square_init_duals    yes\n";
+    // options += "String alpha_for_y    min\n";
+    // options += "Numeric alpha_for_y_tol   1e-5 \n";
+    // options += "String fixed_variable_treatment    relax_bounds\n";
+    // options += "String derivative_test    second-order\n";
+    // options += "String least_square_init_primal    yes\n";
+    options += "String ma97_order    best\n";
+    options += "String ma97_solve_blas3     yes\n";
+    // options += "String  limited_memory_aug_solver             extended\n";
+
+    // options += "String nlp_scaling_method    equilibration-based\n";
+
+    // turn off any printing
+    options += "Integer print_level   1\n";
+    // options += "String output_file myoutput.txt\n";
+    // options += "String check_derivatives_for_naninf   yes\n";
+    // options += "Integer file_print_level  7\n";
+    // options += "String  sb           yes\n";
+    // maximum number of iterations
+    options += "Integer max_iter     1000\n";
+    // options += "Numeric bound_push     1\n";
+    // options += "Numeric bound_frac     1e-1\n";
+
+
+    // options += "Numeric mu_init          0.001\n";
+    // options += "Numeric barrier_tol_factor     1000\n";
+    // options += "Numeric mu_linear_decrease_factor     0.01\n";
+    // options += "Numeric mu_superlinear_decrease_power     1.99\n";
+    // options += "String mu_allow_fast_monotone_decrease     no\n";
+
+
+    // approximate accuracy in first order necessary conditions;
+    // see Mathematical Programming, Volume 106, Number 1,
+    // Pages 25-57, Equation (6)
+    // options += "String  hessian_approximation            limited-memory\n";
+    // options += "String  hessian_approximation_space             all-variables\n";
+    options += "Numeric tol          1e-8\n";
+    options += "Numeric acceptable_tol          1e-8\n";
+    options += "Numeric acceptable_obj_change_tol          1e10\n";
+
+
+    // options += "Numeric gamma_theta          1e-2\n";
+    // options += "Numeric gamma_phi           1e-2\n";
+    // options += "Numeric theta_max_fact           1e8\n";
+    // options += "Numeric theta_min_fact           1e-8\n";
+    // options += "Numeric eta_phi           1e2\n";
+    // options += "Numeric delta           1e2\n";
+    // options += "Numeric s_phi           1e2\n";
+    // options += "Numeric s_theta           1e2\n";
+    // options += "String recalc_y           yes\n";
+
+    // options += "String mehrotra_algorithm           yes\n";
+    options += "String mehrotra_algorithm           no\n";
+
+
+    // options += "String constraint_violation_norm_type           max-norm\n";
+
+
+    // options += "Numeric soft_resto_pderror_reduction_factor          0\n";
+    // options += "Numeric dual_inf_tol          1e-5\n";
+    // options += "Numeric constr_viol_tol          1e-1\n";
+    // options += "Numeric compl_inf_tol          1e-1\n";
+    
+    // options += "Numeric alpha_min_frac          0.5\n";
+    // options += "Numeric nlp_scaling_max_gradient   1e-5\n";
+    // options += "String bound_mult_init_method         mu-based\n";
+    // options += "Numeric bound_mult_init_val          1e3\n";
+
+    // options += "Numeric findiff_perturbation           1e-5\n";
+    // options += "Numeric constr_viol_tol          1e-3\n";
+    // options += "Numeric bound_relax_factor          0\n";
+    // options += "Numeric nlp_scaling_constr_target_gradient          1e2\n";
+    // options += "Numeric constr_mult_init_max          1e1\n";
+    // options += "Numeric acceptable_tol          1e-10\n";
+    // derivative testing
+    // options += "String  derivative_test            none\n";
+    // maximum amount of random pertubation; e.g.,
+    // when evaluation finite diff
+    // options += "Numeric point_perturbation_radius  1e3\n";
+
+    // place to return solution
+    CppAD::ipopt::solve_result<Dvector> solution;
+    // cout << "IP2 : nx " << nx << " ng" << ng << endl;
+    // cout << "eval2 : fg " << Data::Ch_list.size() + Data::Cv_list.size() + Data::nhe_list.size() + Data::nve_list.size() + Data::chip.soft_num << endl;
+    // // solve the problem
+    
+    CppAD::ipopt::solve<Dvector, IP::FG_eval21>(
+            options, xi, xl, xu, gl, gu, fg_eval, solution
+    );
+    
+    for (int i = 0; i < nx/2; i++){
+        for (int j = 0 ; j < 2 ; j++){
+            // cout << i*4 + j << ' ' << solution.x[i*4 + j] << ' ';
+            if (j == 0){
+                Data::chip.soft[i].width = solution.x[i*2 + j];
+            }else if(j == 1){
+                Data::chip.soft[i].height = solution.x[i*2 + j];
+            }
+            // cout << i*4+j << ' ';
+        }
+        // cout << endl;
+    }
+    Data::IP2_last_obj = solution.obj_value;
+    Data::IP2_last_type = 1;
+
+
+
+    return ;
+}
+
+//IP22()
+void IP22(void){
+    int nx = (Data::chip.soft_num )*2 ;
+    typedef CPPAD_TESTVECTOR( double ) Dvector;
+    Dvector xi(nx);
+    // cout << Data::chip.width << ' ' << Data::chip.height << endl;
+    for (int i = 0; i < nx/2 ; i++){
+        for (int j = 0 ; j < 2; j++){
+            xi[i*2 + j] = j ? Data::chip.soft[i].center_y : Data::chip.soft[i].center_x;
+            // cout << i*2 + j << ' ' << xi[i*2 + j] <<endl;
+        }
+    }
+    // lower and upper limits for x
+    Dvector xl(nx), xu(nx);
+    for (int i = 0; i < nx/2 ; i++){
+        for (int j = 0 ; j < 2; j++){
+            if (j == 0){ // x
+                xl[i*2 + j] = 0;
+                xu[i*2 + j] = Data::chip.width;
+            }else if (j == 1){ // y
+                xl[i*2 + j] = 0;
+                xu[i*2 + j] = Data::chip.height;
+            }
+        }
+    }
+
+
+    // // lower and upper limits for g
+    // int ng = Data::Ch_list.size() + Data::Cv_list.size() + Data::nhe_list.size() + Data::nve_list.size() + Data::chip.soft_num;
+    // int ng = Data::Ch_list.size() + Data::Cv_list.size() + Data::nhe_list.size() + Data::nve_list.size() ;
+    // int ng = Data::Ch_list.size() + Data::Cv_list.size()  + Data::chip.soft_num ;
+    int ng =  2* Data::chip.soft_num;
+    Dvector gl(ng), gu(ng);
+    //Nhe
+    for (int i = 0; i < Data::chip.soft_num; i++){ 
+        gl[i] = 0 ;
+        gu[i] = Data::chip.width;
+
+    }
+    // Nve
+    for (int i = Data::chip.soft_num, j = 0; i < Data::chip.soft_num + Data::chip.soft_num; i++, j++){ 
+        gl[i] = 0 ;
+        gu[i] = Data::chip.height;
+    }
+
+    // object that computes objective and constraints
+    IP::FG_eval22 fg_eval;
+    //IP22()
+    // options
+    std::string options;
+    options += "Retape  true\n";
+    // options += "String linear_solver   mumps\n";
+    options += "String linear_solver   ma97\n";
+    // options += "String linear_system_scaling   none\n";
+    options += "String mu_strategy   adaptive\n";
+    // options += "Numeric mu_max_fact          1e1\n";
+    // options += "Numeric mu_max          1e1\n";
+    // options += "Numeric mu_min          1e-11\n";
+    // options += "Numeric mu_max_fact          1e-10\n";
+    // options += "String adaptive_mu_globalization    kkt-error\n";
+    // options += "Numeric adaptive_mu_kkterror_red_iters    10\n";
+    // options += "Numeric adaptive_mu_kkterror_red_fact     10\n";
+    // options += "String adaptive_mu_kkt_norm_type     1-norm\n";
+    // options += "String adaptive_mu_globalization    obj-constr-filter\n";
+    // options += "Numeric filter_margin_fact    0.1\n";
+    // options += "Numeric filter_max_margin    10\n";
+    // options += "String adaptive_mu_restore_previous_iterate    yes\n";
+    // options += "String adaptive_mu_monotone_init_factor    obj-constr-filter\n";
+    // options += "String mu_oracle    probing\n";
+    // options += "Numeric sigma_max    1e-1\n";
+    // options += "Numeric mu_target    1e1\n";
+
+    // options += "String start_with_resto    yes\n";
+
+
+    // options += "String line_search_method    cg-penalty\n";
+    // options += "Numeric accept_after_max_steps     100\n";
+
+
+    // options += "String jacobian_approximation     finite-difference-values\n";
+    // options += "String gradient_approximation      finite-difference-values\n";
+    // options += "String grad_f_constant    yes\n";
+    // options += "String jac_c_constant    yes\n";
+    // options += "String jac_d_constant    yes\n";
+    // options += "String hessian_constant    yes\n";
+    // options += "String least_square_init_primal    yes\n";
+    // options += "String adaptive_mu_restore_previous_iterate    yes\n"; 
+    // options += "String accept_every_trial_step    yes\n"; 
+    
+
+    options += "String expect_infeasible_problem    yes\n";
+    options += "String start_with_resto    yes\n";
+
+    // options += "Numeric expect_infeasible_problem_ctol     1e-3\n";
+    // options += "Numeric expect_infeasible_problem_ytol     1e1\n";
+
+    // options += "Numeric soft_resto_pderror_reduction_factor     0.9999\n";
+    // options += "Numeric max_soft_resto_iters     1e1\n";
+    // options += "Numeric required_infeasibility_reduction     0.9\n";
+    // options += "Numeric max_resto_iter     3000000\n";
+
+
+    // options += "Numeric evaluate_orig_obj_at_resto_trial     1e-3\n";
+    // options += "Numeric resto_penalty_parameter     1e5\n";
+    // options += "Numeric resto_proximity_weight     1e5\n";
+    // options += "Numeric bound_mult_reset_threshold     1e3\n";
+    // options += "Numeric constr_mult_reset_threshold     1e1\n";
+    // options += "Numeric resto_failure_feasibility_threshold     1e1\n";
+
+
+    // options += "String honor_original_bounds    yes\n";
+
+
+
+    // options += "String least_square_init_duals    yes\n";
+    // options += "String alpha_for_y    min\n";
+    // options += "Numeric alpha_for_y_tol   1e-5 \n";
+    // options += "String fixed_variable_treatment    relax_bounds\n";
+    // options += "String derivative_test    second-order\n";
+    // options += "String least_square_init_primal    yes\n";
+    options += "String ma97_order    best\n";
+    options += "String ma97_solve_blas3     yes\n";
+    // options += "String  limited_memory_aug_solver             extended\n";
+
+    // options += "String nlp_scaling_method    equilibration-based\n";
+
+    // turn off any printing
+    options += "Integer print_level   5\n";
+    // options += "String output_file myoutput.txt\n";
+    // options += "String check_derivatives_for_naninf   yes\n";
+    // options += "Integer file_print_level  7\n";
+    // options += "String  sb           yes\n";
+    // maximum number of iterations
+    options += "Integer max_iter     10000\n";
+    // options += "Numeric bound_push     1\n";
+    // options += "Numeric bound_frac     1e-1\n";
+
+
+    // options += "Numeric mu_init          0.001\n";
+    // options += "Numeric barrier_tol_factor     1000\n";
+    // options += "Numeric mu_linear_decrease_factor     0.01\n";
+    // options += "Numeric mu_superlinear_decrease_power     1.99\n";
+    // options += "String mu_allow_fast_monotone_decrease     no\n";
+
+
+    // approximate accuracy in first order necessary conditions;
+    // see Mathematical Programming, Volume 106, Number 1,
+    // Pages 25-57, Equation (6)
+    // options += "String  hessian_approximation            limited-memory\n";
+    // options += "String  hessian_approximation_space             all-variables\n";
+    options += "Numeric tol          1e-8\n";
+    options += "Numeric acceptable_tol          1e-8\n";
+    // options += "Numeric acceptable_obj_change_tol          1e-8\n";
+
+
+    // options += "Numeric gamma_theta          1e-2\n";
+    // options += "Numeric gamma_phi           1e-2\n";
+    // options += "Numeric theta_max_fact           1e8\n";
+    // options += "Numeric theta_min_fact           1e-8\n";
+    // options += "Numeric eta_phi           1e2\n";
+    // options += "Numeric delta           1e2\n";
+    // options += "Numeric s_phi           1e2\n";
+    // options += "Numeric s_theta           1e2\n";
+    // options += "String recalc_y           yes\n";
+
+    // options += "String mehrotra_algorithm           yes\n";
+    // options += "String mehrotra_algorithm           no\n";
+
+
+    // options += "String constraint_violation_norm_type           max-norm\n";
+
+
+    // options += "Numeric soft_resto_pderror_reduction_factor          0\n";
+    // options += "Numeric dual_inf_tol          1e-5\n";
+    // options += "Numeric constr_viol_tol          1e-1\n";
+    // options += "Numeric compl_inf_tol          1e-1\n";
+    
+    // options += "Numeric alpha_min_frac          0.5\n";
+    // options += "Numeric nlp_scaling_max_gradient   1e-5\n";
+    // options += "String bound_mult_init_method         mu-based\n";
+    // options += "Numeric bound_mult_init_val          1e3\n";
+
+    // options += "Numeric findiff_perturbation           1e-5\n";
+    // options += "Numeric constr_viol_tol          1e-3\n";
+    // options += "Numeric bound_relax_factor          0\n";
+    // options += "Numeric nlp_scaling_constr_target_gradient          1e2\n";
+    // options += "Numeric constr_mult_init_max          1e1\n";
+    // options += "Numeric acceptable_tol          1e-10\n";
+    // derivative testing
+    // options += "String  derivative_test            none\n";
+    // maximum amount of random pertubation; e.g.,
+    // when evaluation finite diff
+    // options += "Numeric point_perturbation_radius  1e3\n";
+
+    // place to return solution
+    CppAD::ipopt::solve_result<Dvector> solution;
+    // cout << "IP2 : nx " << nx << " ng" << ng << endl;
+    // cout << "eval2 : fg " << Data::Ch_list.size() + Data::Cv_list.size() + Data::nhe_list.size() + Data::nve_list.size() + Data::chip.soft_num << endl;
+    // // solve the problem
+    
+    CppAD::ipopt::solve<Dvector, IP::FG_eval22>(
+            options, xi, xl, xu, gl, gu, fg_eval, solution
+    );
+    
+    // // save the solution and change r to widthand height
+    // ok &= solution.status == CppAD::ipopt::solve_result<Dvector>::success;
+    for (int i = 0; i < nx/2; i++){
+        for (int j = 0 ; j < 2 ; j++){
+            // cout << i*4 + j << ' ' << solution.x[i*4 + j] << ' ';
+            if (j == 0){
+                Data::chip.soft[i].center_x = solution.x[i*2 + j];
+            }else if(j == 1){
+                Data::chip.soft[i].center_y = solution.x[i*2 + j];
+            }
+            // cout << i*4+j << ' ';
+        }
+        // cout << endl;
+    }
+    Data::IP2_last_obj = solution.obj_value;
+    Data::IP2_last_type = 2;
+    
+    return ;
+}
+
+
+
+int findValue(const std::map<myPoint, int>& coordinates_map, double x, double y) {
+    myPoint search_point = {x, y};
+    auto it = coordinates_map.find(search_point);
+    if (it != coordinates_map.end()) {
+        return it->second; 
+    } else {
+        return -1;
+    }
+}
+
+bool checkhv_func(ofstream& output, int& a, int& b){ // if vertical : false , if horizontal : true 
+    //check overlapped or not
+    myPoint l1  ,r1 , l2, r2;
+    if (a < Data::chip.soft_num){
+        l1 = {Data::chip.soft[a].center_x, Data::chip.soft[a].center_y};
+        r1 = {Data::chip.soft[a].center_x + Data::chip.soft[a].width, Data::chip.soft[a].center_y + Data::chip.soft[a].height};
+    }else{
+        l1 = {Data::chip.fixed[a-Data::chip.soft_num].center_x, Data::chip.fixed[a-Data::chip.soft_num].center_y};
+        r1 = {Data::chip.fixed[a-Data::chip.soft_num].center_x + Data::chip.fixed[a-Data::chip.soft_num].width, Data::chip.fixed[a-Data::chip.soft_num].center_y + Data::chip.fixed[a-Data::chip.soft_num].height};
+    }
+    if (b < Data::chip.soft_num){
+        l2 = {Data::chip.soft[b].center_x, Data::chip.soft[b].center_y};
+        r2 = {Data::chip.soft[b].center_x + Data::chip.soft[b].width, Data::chip.soft[b].center_y + Data::chip.soft[b].height};
+    }else{
+        l2 = {Data::chip.fixed[b-Data::chip.soft_num].center_x, Data::chip.fixed[b-Data::chip.soft_num].center_y};
+        r2 = {Data::chip.fixed[b-Data::chip.soft_num].center_x + Data::chip.fixed[b-Data::chip.soft_num].width, Data::chip.fixed[b-Data::chip.soft_num].center_y + Data::chip.fixed[b-Data::chip.soft_num].height};
+    }
+    bool overlapped = !(l1.x >= r2.x || l2.x >= r1.x || l1.y >= r2.y || l2.y >= r1.y);
+    // output << round((r1.x + l1.x)/2)   << ' ' << round((r1.y + l1.y)/2)  << ' ' << round( (r2.x + l2.x)/2) << ' ' << round((r2.y + l2.y)/2)  << ' ' << endl;
+    // output << round( l1.x)   << ' ' << round(l1.y)  << ' ' << round( r1.x) << ' ' << round(r1.y)  << ' ' << endl;
+    // output << round( l2.x)   << ' ' << round(l2.y)  << ' ' << round( r2.x) << ' ' << round(r2.y)  << ' ' << endl;
+
+    // check vertical or horizotal
+    int rec_width, rec_height;
+    bool h_true ;
+    if (overlapped){
+        rec_width = min(r1.x,r2.x) - max(l1.x, l2.x);
+        rec_height = min(r1.y,r2.y) - max(l1.y, l2.y);
+        h_true =  rec_height >= rec_width; // true => horizontal
+        // update overlapped num
+        if(!(l1.x > r2.x || l2.x > r1.x || l1.y > r2.y || l2.y > r1.y)){
+            // int t1 = a , t2 = b;
+            // Data::overlapped_list.push_back({t1, t2});
+            Data::IP2_overlapped_num++;
+            if ( (r1.x + l1.x)/2 == (r2.x + l2.x )/2 &&  ((r1.y + l1.y)/2) == ((r2.y + l2.y)/2)){
+                if (a < Data::chip.soft_num){
+                    if (b < Data::chip.soft_num){
+                        Data::chip.soft[a].center_x +=  Data::chip.soft[b].width; 
+                    }else{
+                        Data::chip.soft[a].center_x +=  Data::chip.fixed[b-Data::chip.soft_num].width; 
+                    }
+                }else{
+                    if (b < Data::chip.soft_num){
+                        Data::chip.soft[b].center_x +=  Data::chip.fixed[a -Data::chip.soft_num ].width; 
+                    }
+                }                
+
+            }
+        }
+    }else{
+        rec_width = abs((l1.x + r1.x)/2 - (l2.x + r2.x)/2);
+        rec_height = abs((l1.y + r1.y)/2 - (l2.y + r2.y)/2);
+        h_true =  rec_width >= rec_height; // true => horizontal
+    }
+    if (h_true){
+        // if (a == Data::chip.soft_num+2 ){
+        //     cout << Data::chip.fixed[a - Data::chip.soft_num].name << " 1a " << b << endl;
+        // }else if ( b == Data::chip.soft_num+2){
+        //     cout << Data::chip.fixed[b - Data::chip.soft_num].name  << " 1b " << a << endl;
+        // }
+        if (( (r1.x + l1.x)/2) > ((r2.x + l2.x )/2)){
+            int t = a;
+            a = b;
+            b = t;
+            // output << round((r2.x + l2.x )/2)   << ' ' << round((r2.y + l2.y)/2)  << ' ' << round( (r1.x + l1.x)/2) << ' ' << round((r1.y + l1.y)/2)  << ' ' << endl;
+        }else if(l1.x < l2.x) {
+        }
+        // if (a == Data::chip.soft_num+2 ){
+        //     cout << Data::chip.fixed[a - Data::chip.soft_num].name << " 1a " << b << endl;
+        // }else if ( b == Data::chip.soft_num+2){
+        //     cout << Data::chip.fixed[b - Data::chip.soft_num].name  << " 1b " << a << "  " << Data::chip.fixed[b - Data::chip.soft_num].lA << "  " << Data::chip.fixed[b - Data::chip.soft_num].A << endl;
+        // }
+        if (a >= Data::chip.soft_num && (Data::chip.fixed[a- Data::chip.soft_num].lA == 2 )){
+            int t = a;
+            a = b;
+            b = t;
+        }
+        if (b >= Data::chip.soft_num && (Data::chip.fixed[b- Data::chip.soft_num].lA == 1 )){
+            cout << "!!!!" << endl;
+            int t = a;
+            a = b;
+            b = t;
+        }
+            Data::Nh_start[b] = false;
+            Data::Nh_end[a] = false;
+            // output << round((r1.x + l1.x)/2)   << ' ' << round((r1.y + l1.y)/2)  << ' ' << round( (r2.x + l2.x)/2) << ' ' << round((r2.y + l2.y)/2)  << ' ' << endl;
+    }else{
+        // if (a == Data::chip.soft_num+2 ){
+        //     cout << Data::chip.fixed[a - Data::chip.soft_num].name << " 2a " << Data::chip.soft[b].name << endl;
+        // }else if ( b == Data::chip.soft_num+2){
+        //     cout << Data::chip.fixed[b - Data::chip.soft_num].name  << "2b " << Data::chip.soft[a].name << endl;
+        // }
+        if (((r1.y + l1.y)/2) > ((r2.y + l2.y)/2)){
+            int t = a;
+            a = b;
+            b = t;
+
+            // output << round((r2.x + l2.x )/2)   << ' ' << round((r2.y + l2.y)/2)  << ' ' << round( (r1.x + l1.x)/2) << ' ' << round((r1.y + l1.y)/2)  << ' ' << endl;
+        }else if(l1.y < l2.y) {
+        }
+        if (a >= Data::chip.soft_num && (Data::chip.fixed[a- Data::chip.soft_num].A == 2)){
+            int t = a;
+            a = b;
+            b = t;
+        }
+        if (b >= Data::chip.soft_num && (Data::chip.fixed[b- Data::chip.soft_num].A == 1)){
+            int t = a;
+            a = b;
+            b = t;
+        }
+
+            Data::Nv_start[b] = false;
+            Data::Nv_end[a] = false;
+
+        // output << round((r1.x + l1.x)/2)   << ' ' << round((r1.y + l1.y)/2)  << ' ' << round( (r2.x + l2.x)/2) << ' ' << round((r2.y + l2.y)/2)  << ' ' << endl;
+    }
+        // if (a == Data::chip.soft_num+2 ){
+        //     cout << Data::chip.fixed[a - Data::chip.soft_num].name << " 1a " << b << endl;
+        // }else if ( b == Data::chip.soft_num+2){
+        //     cout << Data::chip.fixed[b - Data::chip.soft_num].name  << " 1b " << a << endl;
+        // }
+    return h_true;
+}
+
+bool edgeComparator(const edge& e1, const edge& e2) {
+    if (e1.a == e2.a)
+        return e1.b < e2.b;
+    return e1.a < e2.a;
+}
+
+
+void expand_overlapped_ch(int n){
+        for (int i = 0; i < Data::ch_pos[n].size() ; i++){ 
+            // cout << Data::ch_pos[n][i] << endl;
+            if (Data::ch_pos[n][i] < Data::chip.soft_num){
+                if (n < Data::chip.soft_num){
+                    Data::chip.soft[Data::ch_pos[n][i]].center_x = Data::chip.soft[n].center_x + Data::chip.soft[n].width;
+                    // cout << Data::chip.soft[n].name << ' ' << Data::chip.soft[Data::ch_pos[n][i]].name << endl;
+                }else{
+                    Data::chip.soft[Data::ch_pos[n][i]].center_x = Data::chip.fixed[n-Data::chip.soft_num].center_x + Data::chip.fixed[n-Data::chip.soft_num].width;
+                    // cout << Data::chip.fixed[n-Data::chip.soft_num].name << ' ' << Data::chip.soft[Data::ch_pos[n][i]].name << endl;
+                }
+            }else{
+                if (n < Data::chip.soft_num){
+                    Data::chip.soft[n].center_x = Data::chip.fixed[Data::ch_pos[n][i]-Data::chip.soft_num].center_x - Data::chip.soft[n].width;
+                    // cout << Data::chip.soft[n].name << ' ' << Data::chip.fixed[Data::ch_pos[n][i]-Data::chip.soft_num].name << endl;
+                }else{
+                    // fixed fixed
+                }
+            }
+        }
+        for (int i = 0; i < Data::ch_pos[n].size() ; i++){ 
+            // cout << n << ' ' << Data::ch_pos[n][i]<< endl;
+            expand_overlapped_ch(Data::ch_pos[n][i]);
+
+        }
+}
+
+
+
+void expand_overlapped_cv(int n){
+        for (int i = 0; i < Data::cv_pos[n].size() ; i++){ 
+
+            if (Data::cv_pos[n][i] < Data::chip.soft_num){
+                if (n < Data::chip.soft_num){
+                    Data::chip.soft[Data::cv_pos[n][i]].center_y = Data::chip.soft[n].center_y + Data::chip.soft[n].height;
+                    // cout << Data::chip.soft[n].name << ' ' << Data::chip.soft[Data::cv_pos[n][i]].name << endl;
+                }else{
+                    Data::chip.soft[Data::cv_pos[n][i]].center_y = Data::chip.fixed[n-Data::chip.soft_num].center_y + Data::chip.fixed[n-Data::chip.soft_num].height;
+                    // cout << Data::chip.fixed[n-Data::chip.soft_num].name << ' ' << Data::chip.soft[Data::cv_pos[n][i]].name << endl;
+                }
+            }else{
+                if (n < Data::chip.soft_num){
+                    Data::chip.soft[n].center_y = Data::chip.fixed[Data::cv_pos[n][i]-Data::chip.soft_num].center_y - Data::chip.soft[n].height;
+                    // cout << Data::chip.soft[n].name << ' ' << Data::chip.fixed[Data::cv_pos[n][i]-Data::chip.soft_num].name << endl;
+                }else{
+                    // fixed fixed
+                }
+            }
+        }
+        for (int i = 0; i < Data::cv_pos[n].size() ; i++){ 
+            cout << n << ' ' << Data::cv_pos[n][i] << endl;
+            expand_overlapped_ch(Data::cv_pos[n][i]);
+        }
+
+
+
+
+}
+
+
+
+void expand_overlapped_ch_wh(int n){
+        for (int i = 0; i < Data::ch_pos[n].size() ; i++){ 
+            // cout << Data::ch_pos[n][i] << endl;
+            if (Data::ch_pos[n][i] < Data::chip.soft_num){
+                if (n < Data::chip.soft_num){
+                    if (Data::chip.soft[Data::ch_pos[n][i]].center_x - Data::chip.soft[n].center_x < 1.5 * Data::chip.soft[n].width && Data::chip.soft[Data::ch_pos[n][i]].center_x - Data::chip.soft[n].center_x > 0.5 * Data::chip.soft[n].width){
+                        Data::chip.soft[n].width = Data::chip.soft[Data::ch_pos[n][i]].center_x - Data::chip.soft[n].center_x;
+                    }
+                    // cout << Data::chip.soft[n].name << ' ' << Data::chip.soft[Data::ch_pos[n][i]].name << endl;
+                }else{
+                    Data::chip.soft[Data::ch_pos[n][i]].center_x = Data::chip.fixed[n-Data::chip.soft_num].center_x + Data::chip.fixed[n-Data::chip.soft_num].width;
+                    // cout << Data::chip.fixed[n-Data::chip.soft_num].name << ' ' << Data::chip.soft[Data::ch_pos[n][i]].name << endl;
+                }
+            }else{
+                if (n < Data::chip.soft_num){
+                    if (Data::chip.fixed[Data::ch_pos[n][i]-Data::chip.soft_num].center_x - Data::chip.soft[n].center_x < 1.5 * Data::chip.soft[n].width && Data::chip.fixed[Data::ch_pos[n][i]-Data::chip.soft_num].center_x - Data::chip.soft[n].center_x > 0.5 * Data::chip.soft[n].width){
+                        Data::chip.soft[n].width = Data::chip.fixed[Data::ch_pos[n][i]-Data::chip.soft_num].center_x - Data::chip.soft[n].center_x;
+                    }
+                    // cout << Data::chip.soft[n].name << ' ' << Data::chip.fixed[Data::ch_pos[n][i]-Data::chip.soft_num].name << endl;
+                }else{
+                    // fixed fixed
+                }
+            }
+        }
+        for (int i = 0; i < Data::ch_pos[n].size() ; i++){ 
+            expand_overlapped_ch_wh(Data::ch_pos[n][i]);
+        }
+}
+
+
+
+void expand_overlapped_cv_wh(int n){
+        for (int i = 0; i < Data::cv_pos[n].size() ; i++){ 
+            if (Data::cv_pos[n][i] < Data::chip.soft_num){
+                if (n < Data::chip.soft_num){
+                    Data::chip.soft[n].height = Data::chip.soft[Data::cv_pos[n][i]].center_y - Data::chip.soft[n].center_y;
+                    // cout << Data::chip.soft[n].name << ' ' << Data::chip.soft[Data::cv_pos[n][i]].name << endl;
+                }else{
+                    Data::chip.soft[Data::cv_pos[n][i]].center_y = Data::chip.fixed[n-Data::chip.soft_num].center_y + Data::chip.fixed[n-Data::chip.soft_num].height;
+                    // cout << Data::chip.fixed[n-Data::chip.soft_num].name << ' ' << Data::chip.soft[Data::cv_pos[n][i]].name << endl;
+                }
+            }else{
+                if (n < Data::chip.soft_num){
+                    Data::chip.soft[n].height = Data::chip.fixed[Data::cv_pos[n][i]-Data::chip.soft_num].center_y - Data::chip.soft[n].center_y;
+                    // cout << Data::chip.soft[n].name << ' ' << Data::chip.fixed[Data::cv_pos[n][i]-Data::chip.soft_num].name << endl;
+                }else{
+                    // fixed fixed
+                }
+            }
+        }
+        for (int i = 0; i < Data::cv_pos[n].size() ; i++){ 
+            expand_overlapped_cv_wh(Data::cv_pos[n][i]);
+        }
+
+
+
+
+}
+
+
+void cvch_position(){
+    // cout << "ch" << endl;
+    // for (int i = 0; i < Data::Ch_list.size(); i++){ 
+    //     // cout << Data::Ch_list[i].a << ' ' << Data::Ch_list[i].b << endl;
+    //     Data::ch_pos[Data::Ch_list[i].a].push_back(Data::Ch_list[i].b);
+    // }
+    for (int i = 0; i < Data::Cv_list.size(); i++){ 
+        // cout << Data::Ch_list[i].a << ' ' << Data::Ch_list[i].b << endl;
+        Data::cv_pos[Data::Cv_list[i].a].push_back(Data::Cv_list[i].b);
+    }
+        // cout << "!" << endl;
+}
+
+void straight(){
+    for (int i = 0; i < Data::nhs_list.size();i++){
+        // if (Data::nhs_list[i] < Data::chip.soft_num){
+        //     Data::chip.soft[Data::nhs_list[i]].center_x = 0;
+        // }
+        expand_overlapped_ch(Data::nhs_list[i]);
+        // if (Data::nhs_list[i] < Data::chip.soft_num){
+        //     cout << Data::chip.soft[Data::nhs_list[i]].name << endl;    
+        // }else{
+        //     cout << Data::chip.fixed[Data::nhs_list[i] - Data::chip.soft_num].name << endl;    
+        // }
+    }
+//     // cout << "nvs" <<endl;
+    for (int i = 0; i < Data::nvs_list.size();i++){
+        // if (Data::nvs_list[i] < Data::chip.soft_num){
+        //     Data::chip.soft[Data::nhs_list[i]].center_y = 0;
+        // }
+        expand_overlapped_cv(Data::nvs_list[i]);
+        // if (Data::nvs_list[i] < Data::chip.soft_num){
+        //     cout << Data::chip.soft[Data::nvs_list[i]].name << endl;    
+        // }else{
+        //     cout << Data::chip.fixed[Data::nvs_list[i] - Data::chip.soft_num].name << endl;    
+        // }
+    }       
+}
+void straight_wh(){
+    for (int i = 0; i < Data::nhs_list.size();i++){
+        if (Data::nhs_list[i] < Data::chip.soft_num){
+            Data::chip.soft[Data::nhs_list[i]].center_x = 0;
+        }
+        expand_overlapped_ch_wh(Data::nhs_list[i]);
+        // if (Data::nhs_list[i] < Data::chip.soft_num){
+        //     cout << Data::chip.soft[Data::nhs_list[i]].name << endl;    
+        // }else{
+        //     cout << Data::chip.fixed[Data::nhs_list[i] - Data::chip.soft_num].name << endl;    
+        // }
+    }
+    // cout << "nvs" <<endl;
+    for (int i = 0; i < Data::nvs_list.size();i++){
+        if (Data::nvs_list[i] < Data::chip.soft_num){
+            Data::chip.soft[Data::nhs_list[i]].center_y = 0;
+        }
+        expand_overlapped_cv_wh(Data::nvs_list[i]);
+        // if (Data::nvs_list[i] < Data::chip.soft_num){
+        //     cout << Data::chip.soft[Data::nvs_list[i]].name << endl;    
+        // }else{
+        //     cout << Data::chip.fixed[Data::nvs_list[i] - Data::chip.soft_num].name << endl;    
+        // }
+    }       
+}
+
+
+void go_back_chip(){
+    for (int i = 0; i < Data::chip.soft_num; i++){
+        Data::chip.soft[i].center_x = Data::chip.soft[i].center_x >= Data::chip.width- Data::chip.soft[i].width  ? Data::chip.width - Data::chip.soft[i].width : Data::chip.soft[i].center_x;
+        Data::chip.soft[i].center_y = Data::chip.soft[i].center_y >= Data::chip.height- Data::chip.soft[i].height ? Data::chip.height - Data::chip.soft[i].height : Data::chip.soft[i].center_y;
+
+    }
+}
+
+
+
+int main(int argc, char *argv[]){
+    auto start = std::chrono::high_resolution_clock::now();
+    //input
+    if (argc < 3) {
+        cerr << "Usage: " << argv[0] << " input_file output_file" << endl;
+        return 1;
+    }
+    ifstream input(argv[1]);
+    ofstream output(argv[2]);
+    string t;
+    vector<myPoint> points;
+    //input
+    input >> t >> Data::chip.width >> Data::chip.height;
+    for (int i = 0; i < 3; i++){
+        int N;
+        if (i == 0){
+            input >> t >> Data::chip.soft_num;
+            Data::chip.soft.resize(Data::chip.soft_num);
+            Data::temp_chip.soft.resize(Data::chip.soft_num);
+            for (int j = 0; j < Data::chip.soft_num; j++) {
+                input >> Data::chip.soft[j].name >> Data::chip.soft[j].lA;
+                double temple_r = ceil( sqrt(double(Data::chip.soft[j].lA)/4));
+                // use integer radius temporarily
+                Data::chip.soft[j].r = (temple_r);
+                Data::chip.soft[j].width = ceil( 2* (temple_r));
+                Data::chip.soft[j].height = ceil(2* (temple_r)) ;
+                // cout << (Data::chip.soft[j].lA) << ' ' << ((Data::chip.soft[j].lA)/4)  <<' ' << sqrt((Data::chip.soft[j].lA)/4)  <<' ' << ceil( sqrt(double(Data::chip.soft[j].lA)/4)) << ' ' <<  ceil( 2* (temple_r)) << endl;
+            
+            }
+        }else if (i == 1){
+            input >> t >> Data::chip.fixed_num;
+            Data::chip.fixed.resize(Data::chip.fixed_num);
+            for (int j = 0; j < Data::chip.fixed_num; j++) {
+                input >> Data::chip.fixed[j].name >> Data::chip.fixed[j].center_x >> Data::chip.fixed[j].center_y >> Data::chip.fixed[j].width >> Data::chip.fixed[j].height;
+                Data::chip.fixed[j].center_x += (double(Data::chip.fixed[j].width)/2);
+                Data::chip.fixed[j].center_y += (double(Data::chip.fixed[j].height)/2);
+                points.push_back({Data::chip.fixed[j].center_x, Data::chip.fixed[j].center_y}); // check map
+                Data::chip.fixed[j].lA = Data::chip.fixed[j].width *  Data::chip.fixed[j].height;
+                double temple_r = sqrt(double(Data::chip.fixed[j].lA)/4);
+                // use integer radius temporarily
+                Data::chip.fixed[j].r = (temple_r);
+                //this
+            // cout << "fixed" << j << " " << Data::chip.fixed[j].center_x << " " << Data::chip.fixed[j].center_y << endl;
+            }
+        }else{
+            input >> t >> Data::chip.connect_num;
+            Data::chip.connect.resize(Data::chip.connect_num);
+            for (int j = 0; j < Data::chip.connect_num; j++) {
+                string name[2];
+                input >> name[0] >> name[1] >> Data::chip.connect[j].len;
+                for (int k = 0; k < 2; k++){
+                    auto it = find_if(Data::chip.soft.begin(), Data::chip.soft.end(), [&](const Block& softBlock) {
+                        return softBlock.name == name[k];
+                    });
+                    if (it != Data::chip.soft.end()) {
+                        int index = distance(Data::chip.soft.begin(), it);
+                        Data::chip.connect[j].name[k] = index;
+                    } else {
+                        auto it2 = find_if(Data::chip.fixed.begin(), Data::chip.fixed.end(), [&](const Block& fixedBlock) {
+                            return fixedBlock.name == name[k];
+                        });
+                        int index2 = distance(Data::chip.fixed.begin(), it2);
+                        Data::chip.connect[j].name[k] = index2 + Data::chip.soft_num;
+                    }
+                }
+
+            }
+        }
+
+    }
+    
+    // //smaple center & check map
+    // random_device rd;
+    // mt19937 gen(rd());
+    // int minnum = 0, max_w = Data::chip.width-1, max_h = Data::chip.height-1;
+    // uniform_int_distribution<int> dist_w(minnum, max_w), dist_h(minnum, max_h);
+    // for (int i = 0; i< Data::chip.soft_num; i++){
+    //     bool found = false;
+    //     int random_w = dist_w(gen), random_h = dist_h(gen);
+    //     for (const myPoint& point : points) {
+    //         if (point.x == random_w && point.y == random_h) {
+    //             found = true;
+    //             break;
+    //         }
+    //     }
+    //     if (!found){
+    //         Data::chip.soft[i].center_x = double(random_w) ;
+    //         Data::chip.soft[i].center_y = double(random_h) ;
+    //     }else{
+    //         i--;
+    //     }
+    // }
+
+    for (int i = 0; i< Data::chip.soft_num; i++){
+            Data::chip.soft[i].center_x = double(Data::chip.width/2) ;
+            Data::chip.soft[i].center_y = double(Data::chip.height/2) ;
+    }
+
+    //output about before IP1
+        //sample part
+    ////x y w h -> integer , x y w h -> points , x y -> center
+    for (int i = 0; i < Data::chip.soft_num; i++){
+        double tx = abs(round(Data::chip.soft[i].center_x)) , ty = abs(round(Data::chip.soft[i].center_y)) , tw = abs(round(Data::chip.soft[i].width))  , th = abs(round(Data::chip.soft[i].height)) ;
+        if(tw == 0){
+            tw = 1;
+        }
+        if (th == 0){
+            th = 1;
+        }
+        Data::chip.soft[i].points.push_back({round(tx - tw/2) ,round(ty - th/2) });
+        Data::chip.soft[i].points.push_back({round(tx  - tw/2) ,round(ty + th/2) });
+        Data::chip.soft[i].points.push_back({round(tx+tw/2) ,round(ty+th/2) });
+        Data::chip.soft[i].points.push_back({round(tx+tw/2) ,round(ty- th/2) });
+        Data::chip.soft[i].center_x = tx;
+        Data::chip.soft[i].center_y = ty ;
+        Data::chip.soft[i].width = tw;
+        Data::chip.soft[i].height = th;
+    }
+    // output format
+    output << endl << "Start " << endl ;
+    output << "SOFTMODULE " << Data::chip.soft_num << endl;
+    for (int i = 0; i < Data::chip.soft_num; i++) {
+        int point_num = 4;
+        output << Data::chip.soft[i].name << " " << point_num   << endl;
+        for (int j = 0; j < point_num; j++){
+            output << Data::chip.soft[i].points[j].x << ' ' << Data::chip.soft[i].points[j].y << endl;
+        }
+    }
+    for (int i = 0; i < Data::chip.soft_num; i++){
+
+        Data::chip.soft[i].points.resize(0);
+        Data::chip.soft[i].points.resize(0);
+        Data::chip.soft[i].points.resize(0);
+        Data::chip.soft[i].points.resize(0);
+    }
+
+
+
+    // IPOPT 1 : change all center_x , center_y 
+    // Data::IP1_flag = false;
+    // Data::IP1_num = 0;
+    // while (1){
+    //     if (Data::IP1_flag || (Data::IP1_num == 1)){
+    //         // for (int i = 0; i < Data::chip.soft_num ; i++){
+    //         //     Data::chip.soft[i].center_y = Data::temp_chip.soft[i].center_y;
+    //         //     Data::chip.soft[i].center_x = Data::temp_chip.soft[i].center_x;
+    //         // }
+    //         // cout << "100000 ->" << Data::IP1_obj  << " min " << Data::IP1_min_obj << endl;
+    //         break;
+    //    }
+    //    IP1();
+    //    Data::IP1_num++;
+    // }
+
+
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> duration = end - start;
+    // // cout << Data::IP1_num << ' '<< duration.count() <<  endl;
+    for (int t = 0; t <Data::chip.soft_num; t++){
+        Data::chip.soft[t].width = round(Data::chip.soft[t].width* 0.8);
+        Data::chip.soft[t].height = round(Data::chip.soft[t].height* 0.8);
+    }    
+    Data::IP1_x1 = 0;
+    Data::IP1_x2 = Data::chip.width;
+    Data::IP1_y1 = 0;
+    Data::IP1_y2 = Data::chip.height;
+    for (int i = 0 ; i < Data::chip.fixed_num; i++){
+        //find the new width height to do ip1()
+        Data::chip.fixed[i].lA = 0;
+        Data::chip.fixed[i].A = 0;
+
+        int x1, x2, y1, y2;
+        x1 = int(Data::chip.fixed[i].center_x - Data::chip.fixed[i].width/2) ;
+        x2 = int(Data::chip.fixed[i].center_x + Data::chip.fixed[i].width/2) ;
+        y1 = int(Data::chip.fixed[i].center_y - Data::chip.fixed[i].height/2) ;
+        y2 = int(Data::chip.fixed[i].center_y + Data::chip.fixed[i].height/2) ;
+        if (x1 == 0 ){
+            Data::chip.fixed[i].lA = 1;
+            if (Data::IP1_x1 < (x1 + x2)/2){
+                Data::IP1_x1 =  (x1 + x2)/2;
+            }
+        }else if (x2 == Data::chip.width){
+            Data::chip.fixed[i].lA = 2;
+            if (Data::IP1_x2 > (x1 + x2)/2){
+                Data::IP1_x2 =  (x1 + x2)/2;
+            }
+        }
+        if (y1 == 0){
+            Data::chip.fixed[i].A = 1;
+            if (Data::IP1_y1 < (y1 + y2)/2){
+                Data::IP1_y1 =  (y1 + y2)/2;
+            }
+        }else if (y2 == Data::chip.height){
+            Data::chip.fixed[i].A = 2;
+            if (Data::IP1_y2 > (y1 + y2)/2){
+                Data::IP1_y2 =  (y1 + y2)/2;
+            }
+        }
+        cout << Data::chip.fixed[i].name << ' ' << Data::chip.fixed[i].lA << ' ' << Data::chip.fixed[i].A << endl;
+         // cout << x1 << ' ' << x2 << ' ' << y1 << ' ' << y2 << endl; 
+    }
+        // cout << Data::IP1_x1 << ' ' << Data::IP1_x2 << ' ' << Data::IP1_y1 << ' ' << Data::IP1_y2 << endl; 
+    
+        // cout << Data::IP1_x1 << ' ' << Data::IP1_x2 << ' ' << Data::IP1_y1 << ' ' << Data::IP1_y2 << endl; 
+    for (int i = 0; i < 1; i++){
+        IP1();
+    }
+
+    //output about IP1
+        //sample part
+    ////x y w h -> integer , x y w h -> points , x y -> center
+    for (int i = 0; i < Data::chip.soft_num; i++){
+        double tx = abs(round(Data::chip.soft[i].center_x)) , ty = abs(round(Data::chip.soft[i].center_y)) , tw = abs(round(Data::chip.soft[i].width))  , th = abs(round(Data::chip.soft[i].height)) ;
+        if(tw == 0){
+            tw = 1;
+        }
+        if (th == 0){
+            th = 1;
+        }
+        Data::chip.soft[i].points.push_back({round(tx - tw/2) ,round(ty - th/2) });
+        Data::chip.soft[i].points.push_back({round(tx  - tw/2) ,round(ty + th/2) });
+        Data::chip.soft[i].points.push_back({round(tx+tw/2) ,round(ty+th/2) });
+        Data::chip.soft[i].points.push_back({round(tx+tw/2) ,round(ty- th/2) });
+        Data::chip.soft[i].center_x = tx;
+        Data::chip.soft[i].center_y = ty ;
+        Data::chip.soft[i].width = tw;
+        Data::chip.soft[i].height = th;
+    }
+    int end_flag = 0;
+    // for (int i = 0; i < Data::chip.soft_num; i++){
+    //     cout << Data::chip.soft[i].lA << ' ' << Data::chip.soft[i].width * Data::chip.soft[i].height << endl;
+    // }
+    
+    //ipip ip2
+    int num, wh_num = 0;
+    for ( num = 0; num < 5000; num++){ //num!
+        //reset num and flag
+        // output format
+        if (num == 0){
+            output << endl << "IP1 " << endl ;
+            output << endl << "IP1 " << Data::IP2_last_type<<endl ;
+            output << "SOFTMODULE " << Data::chip.soft_num << endl;
+            for (int i = 0; i < Data::chip.soft_num; i++) {
+                int point_num = 4;
+                output << Data::chip.soft[i].name << " " << point_num   << endl;
+                for (int j = 0; j < point_num; j++){
+                    output << Data::chip.soft[i].points[j].x << ' ' << Data::chip.soft[i].points[j].y << endl;
+                }
+            }
+        }        
+        // do DTgraph and the map x,y -> num
+        Data::points.resize(0);
+        for (int i = 0; i < 201; i ++){
+            Data::Nv_start[i] = true;
+            Data::Nh_start[i] = true;
+        }
+        map<myPoint, int> coordinates_map;
+        for (int i = 0; i < Data::chip.soft_num+ Data::chip.fixed_num ; i++){
+            double temp_x , temp_y;
+            temp_x = i < Data::chip.soft_num ? Data::chip.soft[i].center_x : Data::chip.fixed[i-Data::chip.soft_num].center_x;
+            temp_y = i < Data::chip.soft_num ? Data::chip.soft[i].center_y : Data::chip.fixed[i-Data::chip.soft_num].center_y;
+            Data::points.push_back({temp_x,temp_y});
+            coordinates_map[{temp_x, temp_y}] = i;
+            
+        }
+
+        //list all triangle : Ch Cv
+        const auto triangulation = triangulate(Data::points);
+         Data::Cv_list.resize(0);
+         Data::Ch_list.resize(0);
+         
+        //change center to left-bottom
+        for (int i = 0; i < Data::chip.soft_num+ Data::chip.fixed_num ; i++){
+            if (i < Data::chip.soft_num){
+                Data::chip.soft[i].center_x -= Data::chip.soft[i].width/2;
+                Data::chip.soft[i].center_y -= Data::chip.soft[i].height/2;
+
+            }else{  // this
+                Data::chip.fixed[i-Data::chip.soft_num].center_x -= double(Data::chip.fixed[i-Data::chip.soft_num].width)/2;
+                Data::chip.fixed[i-Data::chip.soft_num].center_y -= double(Data::chip.fixed[i-Data::chip.soft_num].height)/2;
+                // cout << "fixed" << i << " " << Data::chip.fixed[i-Data::chip.soft_num].center_x << " " << Data::chip.fixed[i-Data::chip.soft_num].center_y << endl;
+                
+            }        
+        }
+        //reset num and flag
+        Data::IP2_overlapped_num = 0;
+        Data::overlapped_list.resize(0);
+        Data::IP2_edge_num = triangulation.triangles.size() * 3;
+        // output <<endl << "triangle "  << endl;
+        for (auto const& e : triangulation.triangles) {
+            // output << round(e.p0.x)   << ' ' << round(e.p0.y)  << ' ' << round(e.p1.x)   << ' ' << round(e.p1.y)  << ' ' << endl;
+            // output << round(e.p1.x)   << ' ' << round(e.p1.y)  << ' ' << round( e.p2.x)  << ' ' << round(e.p2.y)  << ' ' << endl;
+            // output << round(e.p0.x)   << ' ' << round(e.p0.y)  << ' ' << round( e.p2.x) << ' ' << round(e.p2.y)  << ' ' << endl;
+            
+            int v[3];
+            v[0] = findValue(coordinates_map, e.p0.x, e.p0.y);
+            v[1] = findValue(coordinates_map, e.p1.x, e.p1.y);
+            v[2] = findValue(coordinates_map, e.p2.x, e.p2.y);
+            // output << v[0] << ' ' << round(e.p0.x)   << ' ' << round(e.p0.y)  << endl;
+            // output << v[1] << ' ' << round(e.p1.x)   << ' ' << round(e.p1.y)  << endl;
+            // output << v[2] << ' ' << round(e.p2.x)   << ' ' << round(e.p2.y)  << endl;
+
+            //check have appeared or not ( check linked , four place to check) =>can use to add adddtional edge , don't do it now
+            
+            // check horizontal or verical and link them directly
+            for(int i = 0; i < 3; i++){
+                int j = (j+1)%3;
+                int num_a = min(v[i], v[j]) , num_b = max(v[i], v[j]);
+                if (num_a != num_b){
+                    if (checkhv_func(output, num_a,num_b)){ // horizontal is true , vertical is false.
+                        Data::Ch_list.push_back({num_a, num_b});
+                    }else{
+                        Data::Cv_list.push_back({num_a, num_b});
+                    }
+                }
+            }
+        }
+
+        // if (Data::IP2_area_num1 == 0 && Data::IP2_area_num2 == 0 && Data::IP2_bound_flag == 0 && Data::IP2_overlapped_num == 0){
+        //     break;
+        // }
+        if (end_flag == 1){
+            break;
+        }else if (end_flag >= 1){
+            end_flag++;
+        }
+        if ( Data::IP2_overlapped_num <= 0){
+
+            end_flag = 1;
+        }
+
+
+
+        //delete the same in Cv Ch
+        cout << "!!!! " << num << ' ' << triangulation.triangles.size() *3 << ' ' << Data::Ch_list.size()  << ' ' << Data::Cv_list.size() << endl;
+        sort(Data::Cv_list.begin(), Data::Cv_list.end(), edgeComparator);
+        sort(Data::Ch_list.begin(), Data::Ch_list.end(), edgeComparator);
+        auto it1 = std::unique(Data::Cv_list.begin(), Data::Cv_list.end(), [](const edge& e1, const edge& e2) {
+            return (e1.a == e2.a) && (e1.b == e2.b);
+        });
+        Data::Cv_list.erase(it1, Data::Cv_list.end());
+        auto it2 = std::unique(Data::Ch_list.begin(), Data::Ch_list.end(), [](const edge& e1, const edge& e2) {
+            return (e1.a == e2.a) && (e1.b == e2.b);
+        });
+        Data::Ch_list.erase(it2, Data::Ch_list.end());
+
+        if (num == 0){
+        output  << "connection " << Data::chip.connect_num  << endl; // ch
+            for (int i = 0 ; i < Data::chip.connect_num ; i++){
+                if (Data::chip.connect[i].name[0] < Data::chip.soft_num){
+                    if (Data::chip.connect[i].name[1] < Data::chip.soft_num){
+                        output << round(Data::chip.soft[Data::chip.connect[i].name[0]].center_x + round(Data::chip.soft[Data::chip.connect[i].name[0]].width/2))   << ' ' << round(Data::chip.soft[Data::chip.connect[i].name[0]].center_y + round(Data::chip.soft[Data::chip.connect[i].name[0]].height/2))  << ' ' << round(Data::chip.soft[Data::chip.connect[i].name[1]].center_x + round(Data::chip.soft[Data::chip.connect[i].name[1]].width/2))  << ' ' << round(Data::chip.soft[Data::chip.connect[i].name[1]].center_y + round(Data::chip.soft[Data::chip.connect[i].name[1]].height/2))  << endl;
+                    }else{
+                        output << round( Data::chip.soft[Data::chip.connect[i].name[0]].center_x + round(Data::chip.soft[Data::chip.connect[i].name[0]].width/2)) << ' ' << round( Data::chip.soft[Data::chip.connect[i].name[0]].center_y + round(Data::chip.soft[Data::chip.connect[i].name[0]].height/2)) << ' ' << round(Data::chip.fixed[Data::chip.connect[i].name[1]-Data::chip.soft_num].center_x + round(Data::chip.fixed[Data::chip.connect[i].name[1]-Data::chip.soft_num].width/2)) << ' ' <<round( Data::chip.fixed[Data::chip.connect[i].name[1]-Data::chip.soft_num].center_y + round(Data::chip.fixed[Data::chip.connect[i].name[1]-Data::chip.soft_num].height/2) )<< endl;
+                    }
+                }else{
+                    if (Data::chip.connect[i].name[1] < Data::chip.soft_num){
+                        output << round(Data::chip.fixed[Data::chip.connect[i].name[0]-Data::chip.soft_num].center_x + round(Data::chip.fixed[Data::chip.connect[i].name[0]-Data::chip.soft_num].width/2) )<< ' ' << round(Data::chip.fixed[Data::chip.connect[i].name[0]-Data::chip.soft_num].center_y + round(Data::chip.fixed[Data::chip.connect[i].name[0]-Data::chip.soft_num].height/2))  << ' ' <<round( Data::chip.soft[Data::chip.connect[i].name[1]].center_x + round(Data::chip.soft[Data::chip.connect[i].name[1]].width/2) )<< ' ' <<round( Data::chip.soft[Data::chip.connect[i].name[1]].center_y + round(Data::chip.soft[Data::chip.connect[i].name[1]].height/2)) << endl;
+                    }else{
+                        output << round(Data::chip.fixed[Data::chip.connect[i].name[0]-Data::chip.soft_num].center_x + round(Data::chip.fixed[Data::chip.connect[i].name[0]-Data::chip.soft_num].width/2) )<< ' ' << round(Data::chip.fixed[Data::chip.connect[i].name[0]-Data::chip.soft_num].center_y + round(Data::chip.fixed[Data::chip.connect[i].name[0]-Data::chip.soft_num].height/2) )<< ' ' <<round( Data::chip.fixed[Data::chip.connect[i].name[1]-Data::chip.soft_num].center_x + round(Data::chip.fixed[Data::chip.connect[i].name[1]-Data::chip.soft_num].width/2)) << ' ' << round(Data::chip.fixed[Data::chip.connect[i].name[1]-Data::chip.soft_num].center_y + round(Data::chip.fixed[Data::chip.connect[i].name[1]-Data::chip.soft_num].height/2))<< endl;
+                    }
+                }
+            }
+            output  << "triangle " << Data::Ch_list.size()  << endl; // ch
+            for (int i = 0 ; i < Data::Ch_list.size() ; i++){
+                if (Data::Ch_list[i].a < Data::chip.soft_num){
+                    if (Data::Ch_list[i].b < Data::chip.soft_num){
+                        output << round(Data::chip.soft[Data::Ch_list[i].a].center_x + round(Data::chip.soft[Data::Ch_list[i].a].width/2))   << ' ' << round(Data::chip.soft[Data::Ch_list[i].a].center_y + round(Data::chip.soft[Data::Ch_list[i].a].height/2))  << ' ' << round(Data::chip.soft[Data::Ch_list[i].b].center_x + round(Data::chip.soft[Data::Ch_list[i].b].width/2))  << ' ' << round(Data::chip.soft[Data::Ch_list[i].b].center_y + round(Data::chip.soft[Data::Ch_list[i].b].height/2))  << endl;
+                    }else{
+                        output << round( Data::chip.soft[Data::Ch_list[i].a].center_x + round(Data::chip.soft[Data::Ch_list[i].a].width/2)) << ' ' << round( Data::chip.soft[Data::Ch_list[i].a].center_y + round(Data::chip.soft[Data::Ch_list[i].a].height/2)) << ' ' << round(Data::chip.fixed[Data::Ch_list[i].b-Data::chip.soft_num].center_x + round(Data::chip.fixed[Data::Ch_list[i].b-Data::chip.soft_num].width/2)) << ' ' <<round( Data::chip.fixed[Data::Ch_list[i].b-Data::chip.soft_num].center_y + round(Data::chip.fixed[Data::Ch_list[i].b-Data::chip.soft_num].height/2) )<< endl;
+                    }
+                }else{
+                    if (Data::Ch_list[i].b < Data::chip.soft_num){
+                        output << round(Data::chip.fixed[Data::Ch_list[i].a-Data::chip.soft_num].center_x + round(Data::chip.fixed[Data::Ch_list[i].a-Data::chip.soft_num].width/2) )<< ' ' << round(Data::chip.fixed[Data::Ch_list[i].a-Data::chip.soft_num].center_y + round(Data::chip.fixed[Data::Ch_list[i].a-Data::chip.soft_num].height/2))  << ' ' <<round( Data::chip.soft[Data::Ch_list[i].b].center_x + round(Data::chip.soft[Data::Ch_list[i].b].width/2) )<< ' ' <<round( Data::chip.soft[Data::Ch_list[i].b].center_y + round(Data::chip.soft[Data::Ch_list[i].b].height/2)) << endl;
+                    }else{
+                        output << round(Data::chip.fixed[Data::Ch_list[i].a-Data::chip.soft_num].center_x + round(Data::chip.fixed[Data::Ch_list[i].a-Data::chip.soft_num].width/2) )<< ' ' << round(Data::chip.fixed[Data::Ch_list[i].a-Data::chip.soft_num].center_y + round(Data::chip.fixed[Data::Ch_list[i].a-Data::chip.soft_num].height/2) )<< ' ' <<round( Data::chip.fixed[Data::Ch_list[i].b-Data::chip.soft_num].center_x + round(Data::chip.fixed[Data::Ch_list[i].b-Data::chip.soft_num].width/2)) << ' ' << round(Data::chip.fixed[Data::Ch_list[i].b-Data::chip.soft_num].center_y + round(Data::chip.fixed[Data::Ch_list[i].b-Data::chip.soft_num].height/2))<< endl;
+                    }
+                }
+            }
+            output  << "trianglee " << Data::Cv_list.size() << endl; // cv
+            for (int i = 0 ; i < Data::Cv_list.size() ; i++){
+                if (Data::Cv_list[i].a < Data::chip.soft_num){
+                    if (Data::Cv_list[i].b < Data::chip.soft_num){
+                        output <<round( Data::chip.soft[Data::Cv_list[i].a].center_x + round(Data::chip.soft[Data::Cv_list[i].a].width/2))  << ' ' <<round( Data::chip.soft[Data::Cv_list[i].a].center_y + round(Data::chip.soft[Data::Cv_list[i].a].height/2)) << ' ' << round(Data::chip.soft[Data::Cv_list[i].b].center_x + round(Data::chip.soft[Data::Cv_list[i].b].width/2) )<< ' ' <<round( Data::chip.soft[Data::Cv_list[i].b].center_y + round(Data::chip.soft[Data::Cv_list[i].b].height/2)) << endl;
+                    }else{
+                        output <<round( Data::chip.soft[Data::Cv_list[i].a].center_x + round(Data::chip.soft[Data::Cv_list[i].a].width/2) )<< ' ' <<round( Data::chip.soft[Data::Cv_list[i].a].center_y + round(Data::chip.soft[Data::Cv_list[i].a].height/2) )<< ' ' <<round( Data::chip.fixed[Data::Cv_list[i].b-Data::chip.soft_num].center_x + round(Data::chip.fixed[Data::Cv_list[i].b-Data::chip.soft_num].width/2)) << ' ' << round(Data::chip.fixed[Data::Cv_list[i].b-Data::chip.soft_num].center_y + round(Data::chip.fixed[Data::Cv_list[i].b-Data::chip.soft_num].height/2) )<< endl;
+                    }
+                }else{
+                    if (Data::Cv_list[i].b < Data::chip.soft_num){
+                        output <<round( Data::chip.fixed[Data::Cv_list[i].a-Data::chip.soft_num].center_x + round(Data::chip.fixed[Data::Cv_list[i].a-Data::chip.soft_num].width/2)) << ' ' <<round( Data::chip.fixed[Data::Cv_list[i].a-Data::chip.soft_num].center_y + round(Data::chip.fixed[Data::Cv_list[i].a-Data::chip.soft_num].height/2)) << ' ' <<round( Data::chip.soft[Data::Cv_list[i].b].center_x + round(Data::chip.soft[Data::Cv_list[i].b].width/2) )<< ' ' <<round( Data::chip.soft[Data::Cv_list[i].b].center_y + round(Data::chip.soft[Data::Cv_list[i].b].height/2) )<< endl;
+                    }else{
+                        output <<round( Data::chip.fixed[Data::Cv_list[i].a-Data::chip.soft_num].center_x + round(Data::chip.fixed[Data::Cv_list[i].a-Data::chip.soft_num].width/2) )<< ' ' <<round( Data::chip.fixed[Data::Cv_list[i].a-Data::chip.soft_num].center_y + round(Data::chip.fixed[Data::Cv_list[i].a-Data::chip.soft_num].height/2) )<< ' ' <<round( Data::chip.fixed[Data::Cv_list[i].b-Data::chip.soft_num].center_x + round(Data::chip.fixed[Data::Cv_list[i].b-Data::chip.soft_num].width/2)) << ' ' << round(Data::chip.fixed[Data::Cv_list[i].b-Data::chip.soft_num].center_y + round(Data::chip.fixed[Data::Cv_list[i].b-Data::chip.soft_num].height/2))<< endl;
+                    }
+                }
+            }
+        }
+        Data::nvs_list.resize(0);
+        Data::nve_list.resize(0);
+        Data::nhs_list.resize(0);
+        Data::nhe_list.resize(0);
+
+        // change nv nh to list and define w and h needed to use in ip2
+        double ws = Data::chip.width, we = 0, hs = Data::chip.height, he = 0;
+        for (int i = 0; i < Data::chip.soft_num+ Data::chip.fixed_num ; i++){
+            Data::cv_pos[i].resize(0);
+            Data::ch_pos[i].resize(0);
+            if(Data::Nv_start[i]){
+                // cout << "!!" << endl;
+                Data::nvs_list.push_back(i);
+            }
+            if(Data::Nv_end[i]){
+                Data::nve_list.push_back(i);
+            }
+            if(Data::Nh_start[i]){
+                // cout << "!!" << endl;
+                Data::nhs_list.push_back(i);
+            }
+            if(Data::Nh_end[i]){
+                Data::nhe_list.push_back(i);
+            }
+            if (i < Data::chip.soft_num){
+                ws = ws >  Data::chip.soft[i].center_x ? Data::chip.soft[i].center_x : ws ;
+                we = we <  Data::chip.soft[i].center_x ? Data::chip.soft[i].center_x : we ;
+                hs = hs >  Data::chip.soft[i].center_y ? Data::chip.soft[i].center_y : hs ;
+                he = he <  Data::chip.soft[i].center_x ? Data::chip.soft[i].center_x : he ;
+            }else{
+                ws = ws >  Data::chip.fixed[i-Data::chip.soft_num].center_x ? Data::chip.fixed[i-Data::chip.soft_num].center_x : ws ;
+                we = we <  Data::chip.fixed[i-Data::chip.soft_num].center_x ? Data::chip.fixed[i-Data::chip.soft_num].center_x : we ;
+                hs = hs >  Data::chip.fixed[i-Data::chip.soft_num].center_y ? Data::chip.fixed[i-Data::chip.soft_num].center_y : hs ;
+                he = he <  Data::chip.fixed[i-Data::chip.soft_num].center_x ? Data::chip.fixed[i-Data::chip.soft_num].center_x : he ;
+            }
+        }
+        cvch_position();       
+        Data::IP2_W = we - ws;
+        Data::IP2_H = he - hs;
+
+        for (int i = 0; i < Data::chip.soft_num; i++){
+
+            Data::chip.soft[i].points.resize(0);
+            Data::chip.soft[i].points.resize(0);
+            Data::chip.soft[i].points.resize(0);
+            Data::chip.soft[i].points.resize(0);
+        } 
+        //IPOPT 2 : change circle to rectangle num!   checkhv_func
+        // IP2_last_obj / IP2_last_type -1 -> ip2 . 0 -> ip20 . 1 ip21
+        //choose which ip2 to use
+        // if (num == 0){
+        //     IP2();
+        // }else{
+        //     if (num % 500 == 5){
+        //         if (Data::IP2_bound_flag ){
+        //             if (Data::IP2_last_type == 0){
+        //                 if (Data::IP2_last_obj < 100){
+        //                     IP22();
+        //                 }else{
+        //                     IP2();
+        //                 }
+        //             }else{
+        //                 IP20();
+        //             }
+        //         }else{
+        //             IP20();
+        //         }
+        //     }else{
+        //         IP21();
+        //     }
+        // }
+        // if (num % 3 == 2){
+        //     IP2();
+        // }else if (num % 3 == 1){
+        //     IP20();
+        // }else{
+        //     IP2();
+        // }
+        // if (num == 1 || num == 11){
+        //     IP2();
+        // }else  if(num == 10 ){
+        //     IP20();
+        // }else{
+        //     expand_overlapped_ch();
+        // }
+        // cout << "nhs" <<endl;
+        // if (num < 10){
+        //     straight();
+        //     go_back_chip();
+        // }else if (num == 10){
+        //     IP21();
+        // }else if (num == 11){
+        //     IP2();
+        // }else if (num == 12){
+        //     IP2();
+        // }else if (num == 13){
+        //     straight();
+        //     go_back_chip();
+        // }
+        //     go_back_chip();
+
+
+
+        // expand_overlapped();
+        // IP2();
+        // if (num == 24){
+
+        // }else  if (num == 22 || num == 23 ){
+        //     IP20();
+        //     // straight();
+        // }else if (num == 11){
+        //     // for (int t = 0; t <Data::chip.soft_num; t++){
+        //     //     Data::chip.soft[t].width = round(Data::chip.soft[t].width* 0.8);
+        //     //     Data::chip.soft[t].height = round(Data::chip.soft[t].height* 0.8);
+                
+        //     // }
+        // }else 
+        if (end_flag > 0){
+            IP2();
+        }else if (num % 5){
+            if (wh_num > 5){
+                wh_num = 0;
+                // IP2();
+            }else{
+                IP20();
+            }
+            // straight();
+            wh_num++;
+        }else{
+            // IP20();
+            // IP2();
+            straight();
+            // go_back_chip();
+        }
+                go_back_chip();
+
+
+        ////x y w h -> integer , x y w h -> points , x y -> center
+        for (int i = 0; i < Data::chip.soft_num; i++){
+            double tx = abs(round(Data::chip.soft[i].center_x)) , ty = abs(round(Data::chip.soft[i].center_y)) , tw = abs(round(Data::chip.soft[i].width))  , th = abs(round(Data::chip.soft[i].height)) ;
+            if(tw == 0){
+                tw = 1;
+            }
+            if (th == 0){
+                th = 1;
+            }
+            Data::chip.soft[i].points.push_back({tx, ty});
+            Data::chip.soft[i].points.push_back({tx, ty+th});
+            Data::chip.soft[i].points.push_back({tx+tw, ty+th});
+            Data::chip.soft[i].points.push_back({tx+tw, ty});
+            Data::chip.soft[i].center_x = tx + tw/2;
+            Data::chip.soft[i].center_y = ty + th/2;
+            Data::chip.soft[i].width = tw;
+            Data::chip.soft[i].height = th;
+        }
+        for (int i = 0; i <Data::chip.fixed_num ; i++){
+                Data::chip.fixed[i].center_x += double(Data::chip.fixed[i].width)/2;
+                Data::chip.fixed[i].center_y += double(Data::chip.fixed[i].height)/2;
+        }
+        Data::IP2_area_num1 = 0;
+        Data::IP2_area_num2 = 0;
+        Data::IP2_bound_flag = 0;
+        for (int i = 0; i < Data::chip.soft_num; i++) {
+            int point_num = 4;
+            for (int j = 0; j < point_num; j++){
+                //update
+                if (Data::chip.soft[i].points[j].x < 0 || Data::chip.soft[i].points[j].x > Data::chip.width || Data::chip.soft[i].points[j].y < 0 || Data::chip.soft[i].points[j].y > Data::chip.height){
+                    Data::IP2_bound_flag = 1;
+                }
+            }
+            //update
+            if (Data::chip.soft[i].width * Data::chip.soft[i].height < Data::chip.soft[i].lA ){
+                Data::IP2_area_num1++;
+            }
+            if ( (Data::chip.soft[i].width / Data::chip.soft[i].height) < 1/2 || (Data::chip.soft[i].width / Data::chip.soft[i].height) > 2){
+                Data::IP2_area_num2++;
+            }
+        }        
+        // if (Data::IP2_area_num1 ==0){
+        //     break;
+        // }
+    }
+
+
+    // deal legalization part 
+    cout << "num  " << num << endl;
+    cout << "IP2_overlapped_num " << Data::IP2_overlapped_num << endl;
+    for (int i = 0 ;i < Data::overlapped_list.size(); i++){
+        if (Data::overlapped_list[i].a < Data::chip.soft_num){
+            if (Data::overlapped_list[i].b < Data::chip.soft_num){
+                cout << Data::chip.soft[Data::overlapped_list[i].a].name << ' ' << Data::chip.soft[Data::overlapped_list[i].b].name << endl;
+            }else{
+                cout << Data::chip.soft[Data::overlapped_list[i].a].name << ' ' << Data::chip.fixed[Data::overlapped_list[i].b - Data::chip.soft_num].name << endl;
+
+            }
+        }else{
+            if (Data::overlapped_list[i].b < Data::chip.soft_num){
+                cout << Data::chip.fixed[Data::overlapped_list[i].a - Data::chip.soft_num].name << ' ' << Data::chip.soft[Data::overlapped_list[i].b].name << endl;
+            }else{
+                cout << Data::chip.fixed[Data::overlapped_list[i].a - Data::chip.soft_num].name << ' ' << Data::chip.fixed[Data::overlapped_list[i].b - Data::chip.soft_num].name << endl;
+
+            }
+        }
+    }
+    cout << "IP2_edge_num " << Data::IP2_edge_num << endl;
+    cout << "IP2_bound_flag " << Data::IP2_bound_flag << endl;  // 0 is success
+    cout << "IP2_area_num1 " << Data::IP2_area_num1 << endl; 
+    cout << "IP2_area_num2 " << Data::IP2_area_num2 << endl;
+    // cout << endl ;
+    // for (int i = 0; i < Data::chip.soft_num; i++){
+    //     cout << Data::chip.soft[i].lA << ' ' << Data::chip.soft[i].width * Data::chip.soft[i].height << endl;
+    // }
+    //sample part
+
+    ////conpute length 
+    for (int i = 0; i < Data::chip.connect_num; i++){
+        double x1,y1,x2,y2;
+        int n1 = Data::chip.connect[i].name[0] ,n2 = Data::chip.connect[i].name[1] ;
+        x1 = n1 < Data::chip.soft_num ? Data::chip.soft[n1].center_x : Data::chip.fixed[n1-Data::chip.soft_num].center_x; 
+        y1 = n1 < Data::chip.soft_num ? Data::chip.soft[n1].center_y : Data::chip.fixed[n1-Data::chip.soft_num].center_y; 
+        x2 = n2 < Data::chip.soft_num ? Data::chip.soft[n2].center_x : Data::chip.fixed[n2-Data::chip.soft_num].center_x; 
+        y2 = n2 < Data::chip.soft_num ? Data::chip.soft[n2].center_y : Data::chip.fixed[n2-Data::chip.soft_num].center_y; 
+        Data::chip.length += ( abs(x1-x2) + abs(y1-y2) ) * Data::chip.connect[i].len;
+    }
+
+
+    // output format
+    output << "HPWL " << Data::chip.length << endl;
+    // output << endl << "IP2" << endl; 
+    output << "SOFTMODULE " << Data::chip.soft_num << endl;
+    for (int i = 0; i < Data::chip.soft_num; i++) {
+        int point_num = 4;
+        output << Data::chip.soft[i].name << " " << point_num   << endl;
+        for (int j = 0; j < point_num; j++){
+            output << Data::chip.soft[i].points[j].x << ' ' << Data::chip.soft[i].points[j].y << endl;
+        }
+    }
+    // cout << endl << endl;
+    // cout << "soft" << endl;
+    // for (int i = 0; i < Data::chip.soft_num; i++) {
+    //     cout << Data::chip.soft[i].name << " " << i   << endl;
+    //     cout << "x " << Data::chip.soft[i].points[0].x << ",y " << Data::chip.soft[i].points[0].x << ",w " << Data::chip.soft[i].width << ",h " << Data::chip.soft[i].height << endl;
+
+    // }
+    // cout << "fixed" << endl;
+    // for (int i = 0; i < Data::chip.fixed_num; i++) {
+    //     cout << Data::chip.fixed[i].name << " " << i   << endl;
+    //     cout << "x " << Data::chip.fixed[i].center_x << ",y " << Data::chip.fixed[i].center_y << ",w " << Data::chip.fixed[i].width << ",h " << Data::chip.fixed[i].height << endl;
+    // }
+
+    input.close();
+    output.close();
+    return 0;
+}

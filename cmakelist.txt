@@ -1,0 +1,27 @@
+
+cmake_minimum_required(VERSION 3.5)
+project(ipopt_example)
+
+include_directories(/usr/local/include)
+
+add_executable(solver example.cpp)
+
+# 使用靜態函式庫進行連結
+target_link_libraries(solver
+  /usr/local/lib/libcppad_ipopt.a
+  /usr/local/lib/libipopt.a
+  /usr/local/lib/libcoinmumps.a
+  /usr/local/lib/libcoinhsl.a
+  -static
+  -llapack
+  -lblas
+  -lgfortran
+  -lquadmath
+  -lmetis
+  -fopenmp
+  -static-libgcc
+  -static-libstdc++
+)
+
+# 解決dlopen警告
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--no-as-needed")
