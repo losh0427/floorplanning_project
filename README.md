@@ -1,4 +1,5 @@
-# VLSI Floorplanning using Simulated Annealing
+# Fixed-Outline Floorplanning with Rectilinear Soft Blocks
+
 
 A concise and effective implementation of a floorplanning algorithm for chip design. This project finds an optimal placement for a set of circuit blocks to minimize the total chip area and wirelength, utilizing the simulated annealing optimization technique.
 
