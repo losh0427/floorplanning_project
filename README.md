@@ -11,10 +11,9 @@ A concise and effective implementation of a floorplanning algorithm for chip des
 
 ### Compilation
 
-Clone the repository and use the provided Makefile to compile the project:
+Use the provided Makefile to compile the project:
 
 ```bash
-git clone <your-repo-url>
-cd floorplanning_project
+
 make
 ```
